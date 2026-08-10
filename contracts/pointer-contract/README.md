@@ -57,6 +57,55 @@ This contract is the missing forward reference. See
 
 ## Consumer side: resolving a pointer
 
+> ### Rust integrators: use the `freenet-migrate` resolver, not the steps below
+>
+> `freenet-migrate` ships `freenet_migrate::pointer`, a resolver built directly
+> against this contract's wire format. It carries the anti-rollback floor, the
+> absence-vs-unreachability distinction, and key derivation, none of which a
+> hand-rolled `PointerRecord::decode_verified` call gets for free. Each
+> integrator that decodes records itself has to re-derive the rules in Step 4
+> below on its own.
+>
+> ```rust
+> use freenet_migrate::pointer::{resolve_app_pointer, PointerFloor, PointerOutcome};
+>
+> // The floor starts at `PointerFloor::never_resolved()`, or better, seeded
+> // from your build-time constants. Persist `outcome.next_floor()` — including
+> // for a withdrawal — and pass it back next call, keyed by (author_vk, app_id).
+> let outcome = resolve_app_pointer(&mut io, &author_vk, b"river.room-contract", floor).await?;
+>
+> match &outcome {
+>     // Your own instance's params, never the pointer's.
+>     PointerOutcome::Resolved(r) | PointerOutcome::Unchanged(r) => {
+>         use_key(r.contract_id(&my_own_params))
+>     }
+>     // The author retired the app. There is no current code; do not fall back.
+>     PointerOutcome::Withdrawn { .. } => stop_resolving(),
+>     // The only case where your build-time key is safe.
+>     PointerOutcome::NeverPublished => use_baked_in_key(),
+>     // Stale, CompetingRecord, Unavailable, and any future variant: nothing was
+>     // learned, so keep the key you last derived and retry. Never downgrade.
+>     // Two of these need care when your floor is a withdrawal or a first-run
+>     // build-time seed — see the crate README's full match.
+>     _ => keep_last_resolved_and_retry(),
+> }
+> ```
+>
+> Handle every arm. A bare `if let Some(record) = outcome.resolved()` silently
+> does nothing on the five outcomes that carry no record, which is how a
+> withdrawal, a downgrade attempt, and a plain timeout all become "no output".
+>
+> `io` implements the `PointerIo` trait (an async `PointerFetch` GET); wrap an
+> existing `ProbeIo` with `ConservativeProbeIo` if you have one already. See the
+> module docs on `freenet_migrate::pointer` for the full API
+> (`PointerResolver` is the sans-IO driver for environments without awaitable
+> request/response correlation, e.g. the browser's shared-handler `WebApi`).
+>
+> The rest of this section documents the same resolution by hand: the wire
+> format and the raw `PointerRecord` path. It is what the resolver above does
+> internally, and it is still where you should look if you are implementing a
+> consumer in a language other than Rust, or want the primitives directly.
+
 This is the part integrators get wrong, so here it is exactly.
 
 ### The shapes
@@ -232,16 +281,56 @@ A verified pointer whose `code_hash` is all zeros is a **tombstone**: the author
 has withdrawn the app. Stop resolving and say so. Do not derive a key from 32
 zero bytes; it addresses a contract that does not exist.
 
+**Persist the withdrawal's version as your floor before you stop.** A tombstone
+is an ordinary signed record at a version like any other. A consumer that stops
+resolving without recording that version leaves its floor at the pre-withdrawal
+value, and any peer can then serve a real, validly signed pre-withdrawal record,
+which supersedes that stale floor and resurrects code the author explicitly
+withdrew.
+
+Persist the **fact** of the withdrawal — a flag, or a distinct row state —
+alongside the version, and rebuild the floor from that fact. Do **not** store it
+as a zeroed `code_hash` column and treat it like any other floor: a defaulted or
+half-written hash column has the same bytes, so a consumer that infers withdrawal
+from those bytes lets one bad row retire a healthy app permanently. Rust
+integrators have a constructor per case — `PointerFloor::withdrawn_at(version)`
+for a withdrawal, `PointerFloor::at(version, code_hash)` otherwise — and `at`
+**rejects** an all-zero hash for exactly that reason.
+
+If `at` does reject your stored floor, the floor store is untrustworthy: surface
+it. Never recover with `unwrap_or_else(|_| PointerFloor::never_resolved())`. That
+is the first thing to reach for and it reinstates the fail-open the rejection
+exists to close — it turns a corrupt floor into "first run", the one state that
+unlocks the baked-in build-time key, which is the same resurrection this
+paragraph is about, reached by a different route.
+
+Also note that the tombstone sorts below every real code hash. Once your floor is
+a withdrawal at version *v*, a replayed pre-withdrawal record at *v* loses the
+equal-version tiebreak rather than being reported as a withdrawal, so a consumer
+that treats "the tiebreak went my way, keep my last key" as its recovery path
+resurrects the app from its own memory. Check whether your floor is a withdrawal
+before resuming with any key (`PointerFloor::is_withdrawn`).
+
 ### Step 4 — persist the right thing
 
-Persist `(highest_version_ever_verified, resolved_key)`, not merely "I know a
-pointer exists".
+Persist `(highest_version_ever_verified, code_hash_accepted_at_it)`, not merely
+"I know a pointer exists". Keep one such pair **per `(author_vk, app_id)`**:
+each pointer has its own address and its own independent version space, so a
+shared floor either rejects good records or carries a bound that is too low.
 
-- Reject any record whose `version` is `<=` your highest ever seen. The contract
-  enforces monotonicity across the network, but a node that holds no copy yet
-  (freshly bootstrapped, recently evicted) can transiently serve an older validly
-  signed record, because `validate_state` has no prior state to compare against.
-  Your own high-water mark is what closes that window for you.
+- Reject any record whose `version` is strictly less than your highest ever
+  seen. The contract enforces monotonicity across the network, but a node that
+  holds no copy yet (freshly bootstrapped, recently evicted) can transiently
+  serve an older validly signed record, because `validate_state` has no prior
+  state to compare against. Your own high-water mark is what closes that
+  window for you.
+- At an **equal** version, a byte-identical record is a no-op: keep what you
+  have. A record that is equal in version but names a **different** code hash
+  can only come from the author signing two records at the same version (a
+  retried or threshold-signed publish); break the tie the same way the
+  contract's own `merge` does, on the **lower** code hash, so that two
+  consumers who saw different equal-version records converge on the same
+  answer instead of splitting permanently.
 - Fall back to your baked-in key **only if a pointer has never resolved on this
   install**. Once one has, an unresolvable pointer means *unavailable* — say so,
   or use the last-known-good resolved key. Silently regressing to the baked-in
