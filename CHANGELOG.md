@@ -1,5 +1,173 @@
 # Changelog
 
+## freenet-migrate 0.6.0
+
+**Breaking, contract half only.** Silence is no longer absence
+([#19](https://github.com/freenet/freenet-migrate/issues/19)). The delegate-half
+surface is untouched.
+
+### The mechanism
+
+A backward probe classified a candidate that never answered exactly as it
+classified one that answered "I have nothing". Both were `on_timeout` → a miss →
+the walk advanced. Two consequences, both silent:
+
+* A lineage whose candidates were merely unreachable produced
+  `Outcome::SeedLocal` — the outcome an app reads as "the predecessors were
+  reached and had nothing", at which point it seeds its local snapshot forward
+  and stops asking. A predecessor that was slow, or on a node that had not yet
+  answered, was recorded as permanently empty. No error, no crash: the migration
+  reported success and the data stayed under the old key.
+* One timeout on the newest generation let an older one be adopted — the
+  "generation-blind selection" rollback the driver's own module docs claim is
+  inexpressible. The pre-0.6.0 test suite pinned that as correct behaviour.
+
+Absence now requires a positive answer.
+
+### Changes
+
+* **New: `ProbeAnswer`** (`State` / `Absent` / `Unknown`), the return type of
+  `ProbeIo::get` in place of `Option<Vec<u8>>`. An adapter cannot express "I
+  never heard back" as "the predecessor has nothing" without typing `Absent` and
+  being wrong on purpose. Map stdlib's `ContractResponse::NotFound` to `Absent`
+  and everything else non-answering to `Unknown`.
+* **New: `ProbeDriver::on_absent`** (answered "nothing here") and
+  **`ProbeDriver::on_unknown`** (timeout, send failure, dropped transport).
+* **Deprecated: `ProbeDriver::on_timeout`**, now forwarding to `on_unknown`. It
+  can never seal a predecessor as empty, but it is **not a drop-in** for a call
+  site that also routed positive not-founds through it. Because an unknown halts
+  the walk under `NewestFirstWins`, an app whose only failure path is a watchdog
+  — one that never handles `NotFound`, so an absent generation arrives as a
+  timeout — will stop at its first empty generation and never ask the older
+  ones. If the data lives further down the lineage it is never probed. **That is
+  a recovery outage, not a conservative degradation: recovering becomes never
+  recovering.** River is this shape today, so upgrading its call site is
+  mandatory, not advisory.
+* **New: `Outcome::Indeterminate { local, unresolved }`** — nothing was
+  recovered and at least one candidate's state was not established. Adopt
+  nothing, seal nothing, retry. `unresolved` covers candidates that were asked
+  and never answered **and** candidates the walk never reached, because the hop
+  cap fired or the policy halted earlier. Its `local` is passed through
+  `prepare_forward` like every other outgoing snapshot, since the docs
+  explicitly allow an app to seed it after enough failed attempts and
+  `prepare_forward` is where a stale upgrade pointer gets stripped
+  (freenet/river#427).
+* **Fixed: the hop cap no longer produces a clean `SeedLocal`.** Candidates cut
+  off by the cap were leaving no trace, so a capped walk returned the outcome
+  whose contract is "every candidate answered" for candidates it never asked.
+  They are now folded into `unresolved`, making the result `Indeterminate`.
+* **`Outcome` is now `#[non_exhaustive]`.** Note the limit: it forces a wildcard
+  arm on a `match`, but a `matches!(outcome, Outcome::Recovered { .. })` still
+  absorbs a new variant silently. Delta's only production consumption is exactly
+  that shape (`operations.rs:1355-1362`), so nothing in this crate can make its
+  compiler flag the new variant — Delta needs a deliberate read of the
+  `Indeterminate` path.
+* **New: `Outcome::Recovered::unresolved`** — generations that never answered.
+  Under `FoldAll` the fold is missing their contributions; under
+  `NewestFirstWins` (only reachable via the new
+  `ProbeDriver::continue_past_unknown`) they are generations *newer* than
+  `source` that were never ruled out, so the adoption may be a rollback.
+* **Behaviour: under `SelectionPolicy::NewestFirstWins` an unanswered candidate
+  stops the probe** rather than falling through to an older generation, matching
+  the delegate half's `SecretSelectionPolicy::unresponsive_terminates`. Opt out
+  with `ProbeDriver::continue_past_unknown(RollbackRiskAck::…)`, which forfeits
+  the anti-rollback guarantee for that probe and says so in the type.
+* `ConservativeProbeIo` is no longer lossy: with `ProbeAnswer` three-way it
+  passes a real negative through, so a pointer resolved through it can now reach
+  `PointerOutcome::NeverPublished`. It still keeps silence and absence apart.
+* **Delegate half: docs corrected, and the silent-export path tested for the
+  first time.** No signature change; the production path was already correct.
+  But `MockIo::fetch_secrets` had no way to return `Err` at all — it could only
+  fail at the *preflight* — so "answered the preflight, then went silent on the
+  export" was a correct-but-entirely-untested path. The double can now express
+  it, and three tests pin it: no marker is written, an older generation is not
+  adopted past it under `NewestSnapshotWins`, and Union still walks on.
+
+  The docs that steered adapters wrong: `fetch_secrets` documented `Err` as
+  "aborts the whole migration" — it does not; the driver records `Unresponsive`
+  and the walk continues or stops per policy. That error pushed adapter authors
+  away from `Err` and toward `Ok(vec![])`, which seals a
+  `Done { had_data: false }` marker that is never revisited. `Ok(vec![])` is now
+  documented as the positive claim it is, `Err` as the right answer for silence,
+  and `probe_executable`'s `Ok(true)` no longer claims to make a *later* empty
+  export trustworthy.
+
+### What this release does NOT fix: `NotFound` is not proof of absence
+
+0.6.0 stops a predecessor's *silence* being read as its absence. It does not —
+and this crate cannot — make the network's "not found" trustworthy.
+
+Absence on Freenet is unauthenticated, and a contract that exists answers
+`NotFound` while it is momentarily unfindable. **At the time of writing that is
+the common case, not a corner case:** with the placement migration disabled
+(freenet-core#4440), present-but-unfindable dead-ends measured ~99.6% of all
+`get_not_found` traffic in production telemetry, and a live-network check found
+20 of 25 apparent failures had a `NotFound` logged for a key that exists.
+
+So an all-`Absent` walk is, today, more likely to be reporting a routing failure
+than an empty lineage. `Outcome::SeedLocal` therefore **no longer claims to be
+safe to record as finished** — its previous doc said exactly that, which would
+have moved the #19 shape from a timeout trigger to a dead-end trigger rather
+than removing it. The crate now reports what it established and leaves sealing
+to the app, which is the only place that can weigh it.
+
+`Outcome::SeedLocal` also still absorbs an undecodable answer (`decode -> None`,
+`is_real -> false`), so a schema break across a whole lineage lands there with
+every generation intact underneath — freenet/freenet-migrate#8.
+
+Hardening that actually holds, for an app that must seal something: make the
+operation idempotent so a later run recovers a momentarily-unfindable
+generation, require the same answer across separate attempts spread in time,
+and/or require a connectivity witness before trusting a negative. See
+"Upgrading to 0.6.0" in the README.
+
+### Blast radius: four of the five adopters need a code change
+
+**Three crates will not compile until they are updated**, and `on_timeout`
+forwarding does not help them — it preserves *behaviour*, not *compilation*.
+Verified against each app's `origin/main`:
+
+| App | What breaks | Why |
+|-----|-------------|-----|
+| Atlas (`cli/src/main.rs:840`) | **E0271** | implements `ProbeIo`; `async fn get(..) -> Result<Option<Vec<u8>>>` no longer matches `Result<ProbeAnswer, _>` |
+| Atlas (`cli/src/main.rs:588`) | **E0004** | exhaustive `match outcome` over `Recovered` / `SeedLocal` / `NoLegacy`, no catch-all |
+| River UI (`ui/…/backward_probe.rs:362`) | **E0004** | same shape, `Some(..)` arms plus `None` |
+| River CLI (`cli/src/api.rs:426`) | **E0004** | same shape |
+| Delta (`ui/…/operations.rs:2294`) | test failure | `driver_all_miss_seeds_local_snapshot` asserts `SeedLocal` after an all-`None` response map, which is now `Indeterminate` |
+
+**Two of them fail CI on the deprecation alone**, as a hard error rather than a
+warning: Delta runs `cargo clippy --all-targets -- -D warnings`
+(`.github/workflows/ci.yml:41`) and Atlas sets `RUSTFLAGS: -D warnings`
+(`ci.yml:10`). So `on_timeout` is not a soft landing for either — they must
+classify their call site to build at all.
+
+freenet-git is genuinely unaffected: it takes the build half only
+(`freenet-migrate-build`), which this release does not touch.
+
+The `Outcome` breakage is deliberate rather than incidental. An app that seeds
+its local snapshot forward on `SeedLocal` has to look at `Indeterminate` before
+it ships, and a compile error is the only reliable way to make that happen.
+
+**What each contract-half adopter should do:** map the network's real
+"not found" to `ProbeAnswer::Absent` and everything else non-answering to
+`ProbeAnswer::Unknown` — see "Upgrading to 0.6.0" in the README.
+
+**Atlas is the adopter this most helps**, which is worth stating alongside the
+fact that it is also the one the signature change breaks. Its `classify_probe`
+already sorts a legacy GET into `Absent` / `Empty` / `Failed`
+(`cli/src/main.rs:765`) — a finer classification than the crate could accept —
+and then its `ProbeIo::get` has to flatten **four** distinct situations into one
+`Ok(None)`: a real not-found, an empty body, a failed pre-flight under
+`--dry-run`, and a transport failure under `--dry-run`. That last one is a
+latent instance of exactly this bug living in an adopter today: a dry-run
+transport failure currently reads as absence. With `ProbeAnswer` the mapping is
+a per-arm change and the distinction survives.
+
+Note the version pin: Atlas depends on `freenet-migrate = "0.5.0"`
+(`cli/Cargo.toml:27`) with the `ProbeIo` impl on its **`main`** branch, merged as
+`cddb360` (atlas#42) — not on a branch. It stays on 0.5.0 until it chooses to
+bump.
+
 ## freenet-migrate 0.5.0
 
 **Breaking, delegate half only.** The contract-side surface (`ProbeDriver`,

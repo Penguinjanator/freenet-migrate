@@ -184,20 +184,41 @@ let mut driver = contract_probe(ops, local_snapshot, &params, CONTRACT_LINEAGE,
 loop {
     match driver.next_action() {
         Step::Get(id) => { /* send GET(id), arm a ~12s timer; deliver via
-                              driver.on_response(id, &bytes) / driver.on_timeout(id) */ }
+                              driver.on_response(id, &bytes)  // answered with state
+                              driver.on_absent(id)            // answered NotFound
+                              driver.on_unknown(id)           // timer fired / send failed */ }
         Step::Done => break,
     }
 }
 match driver.take_outcome().unwrap() {
-    Outcome::Recovered { merged, .. } => { /* adopt + PUT under the CURRENT key */ }
-    Outcome::SeedLocal { local }      => { /* seed the local snapshot forward */ }
-    Outcome::NoLegacy                 => { /* fresh app, normal first-run */ }
+    Outcome::Recovered { merged, .. }  => { /* adopt + PUT under the CURRENT key */ }
+    Outcome::SeedLocal { local }       => { /* asked everyone, found nothing THIS
+                                               TIME: seed forward, but see below
+                                               before recording it finished */ }
+    Outcome::Indeterminate { .. }      => { /* a predecessor never answered: adopt
+                                               NOTHING, retry on the next run */ }
+    Outcome::NoLegacy { local }        => { /* fresh app, normal first-run */ }
 }
 ```
 
+**Silence is not absence** ([#19]). A candidate is a miss only when it
+*answered* — with state that does not decode or is not real, or with a positive
+"nothing here" (`on_absent`, from stdlib's `ContractResponse::NotFound`). A
+timeout or transport failure is `on_unknown`: the candidate is recorded
+unresolved, so a slow predecessor is retried rather than recorded empty
+forever. Wire a real `NotFound` signal through if you have one; a probe whose
+candidates answer properly never reaches `Indeterminate`.
+
+**But `NotFound` is not proof either**, and on this network it is wrong more
+often than it is right — see [Upgrading to 0.6.0](#upgrading-to-060). `SeedLocal`
+means "asked everyone, found nothing this time"; the crate deliberately does not
+tell you it is safe to record the migration as finished.
+
 Decisions are fixed by the driver (probing newest-first; undecodable or
-non-real responses and timeouts advance; late responses are single-shot
-ignored; exhaustion seeds the local snapshot; a `prepare_forward` hook strips
+non-real responses and answered absences advance; an unanswered candidate stops
+the walk under `NewestFirstWins` rather than falling through to an older
+generation; late responses are single-shot ignored; an all-answered exhaustion
+seeds the local snapshot; a `prepare_forward` hook strips
 key-relative metadata like upgrade pointers before any forward PUT). The two
 Delta incident decision-bug classes — generation-blind selection and
 scalar-recency selection — are structurally inexpressible in it.
@@ -244,8 +265,7 @@ the app's current `code_hash`.
 > publish is gated on a manual end-to-end run (see the STOP box in
 > [`contracts/pointer-contract/README.md`](./contracts/pointer-contract/README.md)).
 > Until then a resolve returns `NeverPublished` if your transport reports a real
-> "not found", and `Unavailable` if it cannot tell (which is what
-> `ConservativeProbeIo` always reports). So during this period a first-run
+> "not found", and `Unavailable` if it cannot tell. So during this period a first-run
 > consumer legitimately falls back to its baked-in key.
 
 ```rust,ignore
@@ -370,10 +390,11 @@ of the boundary that actually holds it.
 Reaching `NeverPublished` needs a `PointerIo` that can report a real
 `PointerFetch::Absent`. Implementing `PointerIo` directly is the recommended
 path. `ConservativeProbeIo` wraps an existing `ProbeIo` and is useful for
-reusing plumbing you already have, with two inherited costs: its ambiguous
-`Ok(None)` maps to `Unreachable` so it can never unlock the fallback, and
-`ProbeIo`'s GET is specified with `return_contract_code: true`, so it pulls the
-pointer's ~130 KB WASM on every resolve to read a 100-byte record.
+reusing plumbing you already have; since 0.6.0 its mapping is faithful
+(`ProbeAnswer` is three-way too), so it passes a real negative through, with one
+inherited cost: `ProbeIo`'s GET is specified with `return_contract_code: true`,
+so it pulls the pointer's ~130 KB WASM on every resolve to read a 100-byte
+record.
 
 Note also that absence is unauthenticated: Freenet has no proof a contract has
 no state, so a responding node can always claim "not found". That is why the
@@ -678,6 +699,11 @@ leaving the contract-side surface untouched.
 The two halves version independently, so an app can take one without the other.
 Targets current stdlib **0.8.x**.
 
+**Unreleased: 0.6.0**, breaking on the **contract** half — silence is no longer
+absence ([#19]). Four of the five adopters below need a code change, three of
+them to compile at all. See [Upgrading to 0.6.0](#upgrading-to-060) and the
+CHANGELOG.
+
 ### Adopters
 
 The adoption tracked by
@@ -706,6 +732,84 @@ a hard duplicate-symbol error under rust-lld. Adopting the runtime driver
 there is blocked on that workspace moving to stdlib 0.8, which re-keys every
 repo and is its own migration event.
 
+## Upgrading to 0.6.0
+
+0.6.0 makes a predecessor's **silence** distinct from its **absence** ([#19]).
+The whole migration is one decision, made once at the point where your transport
+turns a GET into a result:
+
+| Your transport saw | Answer with | Driver event |
+|---|---|---|
+| state bytes | `ProbeAnswer::State(bytes)` | `on_response(id, &bytes)` |
+| the node's real "not found" — stdlib's **`ContractResponse::NotFound`** | `ProbeAnswer::Absent` | `on_absent(id)` |
+| timeout, send failure, dropped transport, cancelled correlation slot, an unexpected reply | `ProbeAnswer::Unknown` | `on_unknown(id)` |
+
+`ProbeIo::get` returns `ProbeAnswer` in place of `Option<Vec<u8>>`;
+`ProbeDriver::on_timeout` is deprecated and forwards to `on_unknown`, so
+untouched call sites get the *safe* reading — but that preserves behaviour, not
+compilation, and an exhaustive `match` over `Outcome` still has to gain an
+`Indeterminate` arm.
+
+Then handle the new outcome. `Outcome::SeedLocal` now means "every candidate was
+asked and answered, and none had state" — which is evidence that there is nothing
+to recover, **not proof of it**, for the reasons below;
+`Outcome::Indeterminate` means at least one candidate's state was not
+established, so adopt nothing, seal nothing, and retry on the next run.
+
+**The crate cannot do this mapping for you, and deliberately does not try.** It
+is sans-IO because each adopter reaches the network differently — River's UI
+through a shared-handler `WebApi` with no request/response correlation, Atlas
+through its own client wrapper, Delta through its ws layer — so there is no
+single response type a helper could accept. What is common is the *rule*, which
+is the table above; `ContractResponse::NotFound` is the one stdlib variant that
+earns `Absent`, and everything else that is not state is `Unknown`.
+
+### `Absent` is the strongest negative Freenet can give. It is not proof.
+
+Absence is unauthenticated — any responding node can claim "not found" — and a
+contract that genuinely exists answers that way while it is momentarily
+unfindable. **On the current network that is the common case:** with the
+placement migration disabled (freenet-core#4440), present-but-unfindable
+dead-ends measured ~99.6% of all `get_not_found` traffic in production
+telemetry, and a live-network check found 20 of 25 apparent failures had a
+`NotFound` logged for a key that exists.
+
+This is a limit of the network, not of this crate, and it is why `SeedLocal`
+does not claim to be sealable. Advancing the probe past an `Absent` candidate is
+fine — that is all the crate does with it. Concluding the data is gone is not.
+
+If your app must seal something, harden it:
+
+* **Make it idempotent** so a later run recovers a generation that was
+  momentarily unfindable, and tell the operator to re-run. Atlas is the worked
+  example: it prints the not-found generation loudly and says re-running will
+  pick it up.
+* **Require agreement across separate attempts**, spread in time, rather than
+  acting on one walk. One `Absent` is a data point; the same `Absent` on three
+  runs over an hour is evidence.
+* **Require a connectivity witness** — a GET for something you know exists
+  succeeding in the same window — before trusting a negative at all.
+* **Never let a single all-`Absent` walk trigger an irreversible write.**
+
+Note also that an undecodable answer is a miss too, so a schema break across an
+entire lineage produces `SeedLocal` with every generation intact underneath it.
+Making that distinguishable is [#8].
+
+### The `on_timeout` shim is not a drop-in
+
+`on_timeout` forwarding can never seal a predecessor as empty, so it is safe in
+the way that matters most. It is **not** safe for a call site that also routed
+positive not-founds through it. Because an unknown halts the walk under
+`NewestFirstWins`, an app whose only failure path is a watchdog — one that never
+handles `NotFound`, so an absent generation arrives as a timeout — stops at its
+first empty generation and never asks the older ones. If the data lives further
+down the lineage it is never probed, and every probe ends `Indeterminate`. That
+is a recovery **outage**, not a conservative degradation. River is this shape
+today.
+
 ## License
 
 LGPL-3.0-only. See [LICENSE](./LICENSE).
+
+[#19]: https://github.com/freenet/freenet-migrate/issues/19
+[#8]: https://github.com/freenet/freenet-migrate/issues/8
