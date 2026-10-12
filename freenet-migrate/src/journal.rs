@@ -158,9 +158,11 @@
 //!   there). River's sweep and walk read the same predecessor keys.
 //! * It does not detect a predecessor whose export is itself partial: that must
 //!   be an `Err` from the app's [`crate::PredecessorSecretsIo::fetch_secrets`].
-//!   That includes the retry after an interrupted import: only an EMPTY answer
-//!   after data is refused, and a shorter one is believed and resolves
-//!   `Imported`. An app that enumerates through an index the predecessor itself
+//!   A retry after an interrupted import is held to the count the interrupted
+//!   attempt saw (an export with fewer items is not believed, #44), but a first
+//!   attempt that is already short is believed, and so is a retry after the
+//!   journal was lost, corrupt or overwritten by a stale store: the count lives
+//!   only in the journal, and a rebuild from the markers starts it again at 0. An app that enumerates through an index the predecessor itself
 //!   reads (and freenet/freenet-core#5857 can make that read come back empty)
 //!   must not let an unreadable index become a short list. For a predecessor
 //!   already deployed, an index read that failed may look exactly like an
@@ -212,6 +214,10 @@ pub enum JournalResolution {
         rejected: u32,
         /// The writer's import revision on that run.
         revision: u32,
+        /// The most items an attempt that started this import saw the
+        /// predecessor export, carried into the pending entry a higher revision
+        /// reopens it as (#44).
+        items_seen: u32,
     },
     /// It was not imported because a newer predecessor, itself resolved and
     /// data-bearing (or a legacy generation-keyed seal for one), supplied the
@@ -287,6 +293,12 @@ pub enum JournalState {
         /// outcome. Information for the app's own policy; it never resolves the
         /// entry.
         absent_streak: u32,
+        /// The most items an attempt that started an import from it has seen it
+        /// export (the walk's own count, or one the app passed to
+        /// [`crate::note_app_import_started`]); `0` when none was counted. A frozen
+        /// predecessor does not lose items, so a later export with fewer is not
+        /// believed: the walk treats it as a silence (#44).
+        items_seen: u32,
     },
     /// Resolved.
     Resolved(JournalResolution),
@@ -299,6 +311,7 @@ impl JournalState {
             import: ImportFlag::None,
             absent_streak: 0,
             rejected: 0,
+            items_seen: 0,
         }
     }
 }
@@ -416,6 +429,10 @@ struct WireEntry {
     absent_streak: u32,
     rejected: u32,
     revision: u32,
+    /// Pending and imported-with-rejections entries only; absent (0) in a journal
+    /// written before #44.
+    #[serde(default)]
+    items_seen: u32,
 }
 
 /// Fixed-size byte strings as CBOR byte strings (not 32-element integer arrays).
@@ -506,6 +523,7 @@ impl MigrationJournal {
                     import,
                     absent_streak,
                     rejected: n,
+                    items_seen,
                 }) => {
                     rejected = rejected.saturating_add(n);
                     pending.push(PendingPredecessor {
@@ -514,6 +532,7 @@ impl MigrationJournal {
                         attempts,
                         import,
                         absent_streak,
+                        items_seen,
                     });
                 }
                 None => pending.push(PendingPredecessor {
@@ -522,6 +541,7 @@ impl MigrationJournal {
                     attempts: 0,
                     import: ImportFlag::None,
                     absent_streak: 0,
+                    items_seen: 0,
                 }),
             }
         }
@@ -567,6 +587,7 @@ impl MigrationJournal {
                         absent_streak: 0,
                         rejected: 0,
                         revision: 0,
+                        items_seen: 0,
                     };
                     match e.state {
                         JournalState::Pending {
@@ -574,7 +595,9 @@ impl MigrationJournal {
                             import,
                             absent_streak,
                             rejected,
+                            items_seen,
                         } => {
+                            w.items_seen = items_seen;
                             w.attempts = attempts;
                             w.import = u8::from(import == ImportFlag::Started);
                             w.absent_streak = absent_streak;
@@ -585,10 +608,12 @@ impl MigrationJournal {
                         JournalState::Resolved(JournalResolution::ImportedWithRejections {
                             rejected,
                             revision,
+                            items_seen,
                         }) => {
                             w.state = 4;
                             w.rejected = rejected;
                             w.revision = revision;
+                            w.items_seen = items_seen;
                         }
                         JournalState::Resolved(JournalResolution::SupersededByAuthoritative) => {
                             w.state = 5
@@ -638,12 +663,14 @@ impl MigrationJournal {
                     },
                     absent_streak: w.absent_streak,
                     rejected: w.rejected,
+                    items_seen: w.items_seen,
                 },
                 1 => JournalState::Resolved(JournalResolution::Imported),
                 2 => JournalState::Resolved(JournalResolution::NoData),
                 4 => JournalState::Resolved(JournalResolution::ImportedWithRejections {
                     rejected: w.rejected,
                     revision: w.revision,
+                    items_seen: w.items_seen,
                 }),
                 5 => JournalState::Resolved(JournalResolution::SupersededByAuthoritative),
                 other => {
@@ -696,10 +723,41 @@ impl MigrationJournal {
                     import: ImportFlag::Started,
                     absent_streak: 0,
                     rejected: 0,
+                    items_seen: 0,
                 };
                 true
             }
             JournalState::Resolved(_) => false,
+        }
+    }
+
+    /// The most items an attempt that started an import from `predecessor` has
+    /// seen it export, as this journal records it (`0` when none was counted, or
+    /// it is not pending).
+    pub(crate) fn items_seen(&self, predecessor: &DelegateKey) -> u32 {
+        match self.entry(predecessor).map(|e| e.state) {
+            Some(JournalState::Pending { items_seen, .. }) => items_seen,
+            _ => 0,
+        }
+    }
+
+    /// Raise `predecessor`'s [`items_seen`](JournalState::Pending::items_seen) to
+    /// `items` on a pending entry whose import has started. Whether it changed.
+    pub(crate) fn note_items_seen(&mut self, predecessor: &DelegateKey, items: u32) -> bool {
+        match self
+            .entries
+            .get_mut(&key_bytes(predecessor))
+            .map(|e| &mut e.state)
+        {
+            Some(JournalState::Pending {
+                import: ImportFlag::Started,
+                items_seen,
+                ..
+            }) if *items_seen < items => {
+                *items_seen = items;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -719,6 +777,20 @@ impl MigrationJournal {
                 state: JournalState::fresh(),
             });
         let ours = match (entry.state, outcome) {
+            // An import with rejections keeps the count its import saw (a
+            // resolution already stored keeps its own through the merge).
+            (
+                JournalState::Pending { items_seen, .. },
+                RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
+                    rejected,
+                    revision,
+                    items_seen: resolved_seen,
+                }),
+            ) => JournalState::Resolved(JournalResolution::ImportedWithRejections {
+                rejected,
+                revision,
+                items_seen: items_seen.max(resolved_seen),
+            }),
             (_, RunOutcome::Resolved(r)) => JournalState::Resolved(r),
             (
                 JournalState::Pending {
@@ -726,6 +798,7 @@ impl MigrationJournal {
                     import,
                     absent_streak,
                     rejected,
+                    items_seen,
                 },
                 RunOutcome::Unresolved { absent },
             ) => JournalState::Pending {
@@ -737,6 +810,7 @@ impl MigrationJournal {
                     0
                 },
                 rejected,
+                items_seen,
             },
             (current, _) => current,
         };
@@ -791,11 +865,13 @@ fn effective(state: JournalState, binding: &JournalBinding) -> JournalState {
         JournalState::Resolved(JournalResolution::ImportedWithRejections {
             revision,
             rejected,
+            items_seen,
         }) if revision < binding.import_revision => JournalState::Pending {
             attempts: 0,
             import: ImportFlag::None,
             absent_streak: 0,
             rejected,
+            items_seen,
         },
         other => other,
     }
@@ -842,21 +918,63 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
     match (older, newer) {
         (Resolved(a), Resolved(b)) => match (a, b) {
             (
-                JournalResolution::ImportedWithRejections { revision: ra, .. },
-                JournalResolution::ImportedWithRejections { revision: rb, .. },
+                JournalResolution::ImportedWithRejections {
+                    revision: ra,
+                    items_seen: ia,
+                    ..
+                },
+                JournalResolution::ImportedWithRejections {
+                    revision: rb,
+                    items_seen: ib,
+                    ..
+                },
             ) => {
-                if rb >= ra {
-                    Resolved(b)
-                } else {
-                    Resolved(a)
-                }
+                // The higher revision wins; the count only rises (#44).
+                let JournalResolution::ImportedWithRejections {
+                    rejected, revision, ..
+                } = (if rb >= ra { b } else { a })
+                else {
+                    unreachable!()
+                };
+                Resolved(JournalResolution::ImportedWithRejections {
+                    rejected,
+                    revision,
+                    items_seen: ia.max(ib),
+                })
             }
             _ if completeness_rank(b) > completeness_rank(a) => Resolved(b),
             _ => Resolved(a),
         },
-        (Resolved(r), p @ Pending { import, .. }) | (p @ Pending { import, .. }, Resolved(r)) => {
+        (
+            Resolved(r),
+            p @ Pending {
+                import,
+                items_seen: seen,
+                ..
+            },
+        )
+        | (
+            p @ Pending {
+                import,
+                items_seen: seen,
+                ..
+            },
+            Resolved(r),
+        ) => {
             if !r.is_data_bearing() && import == ImportFlag::Started {
                 p
+            } else if let JournalResolution::ImportedWithRejections {
+                rejected,
+                revision,
+                items_seen,
+            } = r
+            {
+                // The count only rises: a pending attempt may have seen more.
+                Resolved(JournalResolution::ImportedWithRejections {
+                    rejected,
+                    revision,
+                    items_seen: items_seen.max(seen),
+                })
             } else {
                 Resolved(r)
             }
@@ -866,6 +984,7 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
                 attempts: a1,
                 import: f1,
                 rejected: r1,
+                items_seen: i1,
                 ..
             },
             Pending {
@@ -873,12 +992,14 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
                 import: f2,
                 absent_streak,
                 rejected: r2,
+                items_seen: i2,
             },
         ) => Pending {
             attempts: a1.max(a2),
             import: f1.max(f2),
             absent_streak,
             rejected: r1.max(r2),
+            items_seen: i1.max(i2),
         },
     }
 }
@@ -909,6 +1030,9 @@ pub struct PendingPredecessor {
     /// How many consecutive journaled walks that examined it found it
     /// definitively not installed.
     pub absent_streak: u32,
+    /// The most items an attempt that started an import from it has seen it
+    /// export (`0` when none was counted).
+    pub items_seen: u32,
 }
 
 /// Completeness of a successor's migration, as its stored journal records it.
@@ -1107,7 +1231,7 @@ pub enum AppImport {
     /// current revision is): nothing was recorded, and the walk will not offer it
     /// again (until a higher import revision reopens a rejection). As far as the
     /// crate knows its data is in the successor, but that can be partial, or
-    /// missing altogether: a short export (#44), a write an old tab made to it
+    /// missing altogether: a short first export, a write an old tab made to it
     /// during a rollout, the items an import path rejected, or a legacy
     /// generation-keyed seal that never covered this data. Writing it again
     /// (unflagged) fills such a gap, and also brings back any key the user deleted

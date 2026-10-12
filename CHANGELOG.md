@@ -2,9 +2,8 @@
 
 ## freenet-migrate 0.7.0
 
-**Unreleased; publish gated on #43** (River's real-node rehearsal, the #41
-marker-store conformance check, #39 or an app override, and whether this ships
-as 0.7.0 or 0.8.0).
+**Unreleased; publish gated on #43** (this release's #44 change, then River's
+real-node rehearsal against main, with real WASM).
 
 **Delegate half only.** Two features and one behaviour change:
 
@@ -131,7 +130,27 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   whose only blemish was permanent rejections has no `Done` marker). A refused
   run reports every predecessor `WriterUnavailable`
   (`WriterStage::JournalUnavailable`), so it never reads complete.
-* `note_app_import_started(successor, lineage, predecessor, policy)` raises the
+* **A shorter export after an import started is not believed (#44).** The
+  journal records, per pending predecessor, the most items an attempt that
+  started an import from it saw it export (merged by maximum). A later export
+  with fewer is reported `Unresponsive`
+  (`PredecessorMigration::exported_fewer_after_data()`), exactly as an empty
+  one after data is, and never resolves the predecessor: a frozen predecessor
+  does not lose items, so the short answer is the fault (a secret or an index
+  the node failed to read). Keys are counted once each; the count survives an
+  import with rejections and the higher revision that reopens it; and a retry
+  re-reads the stored count before its first item, so another session's larger
+  count holds it. This closes the interrupted-import-then-read-fault case
+  (river#760, then freenet-core#5857) when the walk started the import, or the
+  app passed a count with its flag. Still believed: a first attempt that is
+  already short (the app's `fetch_secrets` to make loud); an app-started import
+  flagged with no count; and any retry after the journal was lost or corrupt,
+  or after a stale store dropped the count (the markers do not carry it). Under
+  Union a refused newest generation does not stop older ones, which can then
+  shadow its values under a never-clobber writer (#42). And a predecessor that
+  really does export fewer than it once did (an old tab's deletes, a build whose
+  `fetch_secrets` lists less) stays pending for good (#39).
+* `note_app_import_started(successor, lineage, predecessor, policy, items)` raises the
   same flag for an app that writes migrated data outside the walk (River's
   hand-rolled sweep), once it holds data read from the predecessor and before
   it writes or merges it. It takes the same lineage as `begin` and the walk,
@@ -212,9 +231,9 @@ key beginning with `\0freenet-migrate-journal/` is never exported or imported.
   marker, so an export that can come back partial without an `Err` (one that
   silently skips what it cannot read, or a sub-request whose timeout reads as
   "nothing", as in freenet/delta#100) gets a partial import certified complete.
-  That includes a shorter answer on the retry after an interrupted import (only
-  an empty one is refused, #44), and an index the predecessor reads for itself
-  that a failed read (freenet-core#5857) turns into a short list;
+  That includes an index the predecessor reads for itself that a failed read
+  (freenet-core#5857) turns into a short list on the first attempt. (A retry
+  shorter than an attempt that started an import is refused, below.)
 * **your successor store is durable** (a page-memory marker store cannot hold a
   journal);
 * **your marker store follows the new contract** below;
