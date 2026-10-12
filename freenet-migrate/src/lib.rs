@@ -35,6 +35,11 @@
 //!   / [`import_secrets_once`] primitives over the [`SecretStore`] trait. The
 //!   transport the entry points drive is an internal, redesigned sans-IO seam
 //!   ([`delegate_migrate`]) a future node copy-forward swaps under.
+//! * **Delegate migration completeness** — [`journal`]: a durable
+//!   [`MigrationJournal`] in the successor records which predecessors are dealt
+//!   with, so an app knows on every load whether the walk must run again
+//!   ([`begin_migration_journal`], [`note_app_import_started`],
+//!   [`migrate_delegate_secrets_journaled`], [`journal_status`]).
 //!
 //! ## Preconditions made first-class (design §3)
 //!
@@ -72,6 +77,7 @@ pub mod delegate;
 pub mod delegate_migrate;
 pub mod driver;
 pub mod error;
+pub mod journal;
 pub mod lineage;
 pub mod pointer;
 pub mod successor;
@@ -81,7 +87,7 @@ pub use contract::{
     resolve_predecessors, CarryForward, PermissiveValidatorAck, Resolution,
 };
 pub use delegate::{
-    handle_export_request, import_predecessor_secrets_once, import_secrets_once,
+    handle_export_request, import_predecessor_secrets_once, import_secrets_once, is_reserved_key,
     predecessor_delegate_keys, predecessor_delegate_keys_checked, predecessor_done_marker,
     predecessor_migration_had_data, ExportRequest, ExportScope, ExportedSecrets, ImportOutcome,
     OriginPolicy, PredecessorImportOutcome, SecretPair, SecretStore, SingleAppDelegateAck,
@@ -89,11 +95,13 @@ pub use delegate::{
     PRED_DONE_MARKER_VALUE_EMPTY, PRED_DONE_MARKER_VERSION,
 };
 pub use delegate_migrate::{
-    migrate_delegate_secrets, register_delegate_with_migration, DelegateMigrationReport,
-    ImportTally, ItemWrite, LegacyBridge, MarkerQuery, MigrationAuthorization, MigrationMarker,
-    NoCrossEntryInvariantsAck, PredecessorMigration, PredecessorSecretsIo, RecoveredSecret,
-    RegisterAndMigrateIo, RetryAdvice, SecretSelectionPolicy, SecretStoreIo,
-    SecretStoreWriteFailed, SuccessorSecretsIo, UnionAck, WriterFailure, WriterStage,
+    begin_migration_journal, migrate_delegate_secrets, migrate_delegate_secrets_journaled,
+    note_app_import_started, register_delegate_with_migration, DelegateMigrationReport,
+    ImportTally, ItemWrite, JournaledMigrationReport, LegacyBridge, MarkerQuery,
+    MigrationAuthorization, MigrationMarker, NoCrossEntryInvariantsAck, PredecessorMigration,
+    PredecessorSecretsIo, ProbeVerdict, RecoveredSecret, RegisterAndMigrateIo, RetryAdvice,
+    SecretSelectionPolicy, SecretStoreIo, SecretStoreWriteFailed, SuccessorSecretsIo, UnionAck,
+    WriterFailure, WriterStage,
 };
 pub use driver::{
     contract_probe, migrate_contract, FoldAllAck, NewestFirst, Outcome, ProbeAnswer, ProbeDriver,
@@ -101,6 +109,12 @@ pub use driver::{
     RECOMMENDED_PROBE_TIMEOUT_MS,
 };
 pub use error::MigrateError;
+pub use journal::{
+    journal_status, AppImport, ImportFlag, JournalBinding, JournalDecodeError, JournalEntry,
+    JournalError, JournalResolution, JournalState, JournalStatus, JournaledSuccessorIo,
+    MigrationJournal, PendingPredecessor, PolicyFamily, MIGRATION_JOURNAL_KEY,
+    MIGRATION_JOURNAL_VERSION,
+};
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};
 pub use pointer::{
     is_canonical_field_element, is_valid_app_id_byte, parse_pointer_params, pointer_contract_id,

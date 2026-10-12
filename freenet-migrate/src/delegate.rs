@@ -64,6 +64,12 @@ pub const HOST_ENUMERATION_CAP: usize = 4096;
 /// practice. Marker keys are filtered out of every export and are never
 /// writable from an import payload.
 const MARKER_NS: &[u8] = b"\0freenet-migrate/";
+/// The crate also reserves every key beginning with these bytes, for an app's
+/// migration journal ([`crate::MIGRATION_JOURNAL_KEY`]). It sits OUTSIDE
+/// [`MARKER_NS`] on purpose: a node accepts only migration-marker shapes inside
+/// that one. Keys here are, like markers, never exported, never imported and
+/// never counted as a predecessor's data.
+pub(crate) const JOURNAL_NS: &[u8] = b"\0freenet-migrate-journal/";
 /// Generation-keyed in-progress marker sub-prefix:
 /// `MARKER_NS ++ b"wip:" ++ <gen decimal>` (used by [`import_secrets_once`]).
 const WIP_PREFIX: &[u8] = b"\0freenet-migrate/wip:";
@@ -556,9 +562,11 @@ pub enum PredecessorImportOutcome {
     /// written (idempotent re-run, no resurrection).
     AlreadyMigrated,
     /// At least one `set_secret` write failed (or the completion marker could
-    /// not be written). The completion marker was deliberately withheld, so the
-    /// migration is left in its in-progress state and a retry re-runs it. A
-    /// failed write is never counted as imported.
+    /// not be written), or — with every count zero — the predecessor exported
+    /// nothing although an earlier attempt saw data, which is not believed. The
+    /// completion marker was deliberately withheld, so the migration is left in
+    /// its in-progress state and a retry re-runs it. A failed write is never
+    /// counted as imported.
     Incomplete {
         /// Secrets successfully written on this attempt.
         imported: usize,
@@ -624,6 +632,12 @@ pub enum PredecessorImportOutcome {
 /// * `UnionAllGenerations` imports the late-added older predecessor (never-clobber,
 ///   so only keys the successor lacks), which is exactly the ack'd
 ///   delete-by-absence resurrection that policy opts into.
+///
+/// **Data then empty.** A retry that exports nothing although an earlier attempt
+/// saw data returns `Incomplete` with every count zero and seals nothing: the
+/// empty answer is taken for a fault. A caller retrying on `Incomplete` retries
+/// such a predecessor until it answers with data again, for ever if it really
+/// did lose it.
 pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
     store: &mut S,
     predecessor: &DelegateKey,
@@ -638,17 +652,30 @@ pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
     // The data/empty decision is **sticky-data** across a retry: a predecessor is
     // sealed data-bearing if ANY attempt saw real data. A surviving WIP marker
     // from an earlier (Incomplete) attempt carries that attempt's flag; this
-    // attempt ORs its own observation onto it. So BOTH retry directions are safe —
-    // data-then-empty keeps its data flag, and empty-then-data upgrades to data —
-    // and neither can seal the marker "empty" while data was imported, which would
-    // make NewestSnapshotWins misclassify NoData and fall through to older
-    // generations (resurrection). First attempt: just this call's observation.
+    // attempt ORs its own observation onto it, so empty-then-data upgrades to
+    // data and the marker can never be sealed "empty" while data was imported
+    // (which would make NewestSnapshotWins misclassify NoData and fall through to
+    // older generations: resurrection). First attempt: just this call's
+    // observation.
     let wip_marker = pred_wip_marker(predecessor);
     let current_had_data = secrets.iter().any(|(k, _)| !is_marker(k));
-    let had_data = match store.get_secret(&wip_marker) {
-        Some(flag) => (flag != PRED_DONE_MARKER_VALUE_EMPTY) || current_had_data,
-        None => current_had_data,
-    };
+    let prior_saw_data = store
+        .get_secret(&wip_marker)
+        .is_some_and(|flag| flag != PRED_DONE_MARKER_VALUE_EMPTY);
+    // Data-then-empty is NOT sealed. A frozen predecessor does not lose data, so
+    // an empty export after an attempt that saw data is the fault (freenet-core
+    // reports a secret it failed to read the same way as one that is absent).
+    // Sealing would leave the interrupted attempt's missing keys unasked forever;
+    // instead nothing is written and the in-progress marker stays for a retry,
+    // as `migrate_delegate_secrets` does.
+    if prior_saw_data && !current_had_data {
+        return PredecessorImportOutcome::Incomplete {
+            imported: 0,
+            skipped: 0,
+            failed: 0,
+        };
+    }
+    let had_data = prior_saw_data || current_had_data;
     let marker_value = if had_data {
         PRED_DONE_MARKER_VALUE_DATA
     } else {
@@ -676,13 +703,31 @@ pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
 }
 
 /// Whether a completed migration from `predecessor` is already recorded (its
-/// delegate-key completion marker is present). Lets the migration driver skip a
+/// delegate-key completion marker is present, and not contradicted — see
+/// [`empty_seal_contradicted`]). Lets the migration driver skip a
 /// preflight/fetch round-trip for an already-migrated predecessor.
 pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
     store: &S,
     predecessor: &DelegateKey,
 ) -> bool {
-    store.has_secret(&pred_done_marker(predecessor))
+    store.has_secret(&pred_done_marker(predecessor)) && !empty_seal_contradicted(store, predecessor)
+}
+
+/// Whether `predecessor` carries an EMPTY completion marker AND an in-progress
+/// marker that saw data. A walk never writes that pair on its own account (its
+/// data flag is sticky), so it means an import was started after the empty seal — by the app
+/// ([`crate::note_app_import_started`]) or by a walk re-asking a predecessor a
+/// journal knows holds data. The empty seal is then wrong, and the predecessor
+/// reads as in progress, never as done.
+pub(crate) fn empty_seal_contradicted<S: SecretStore + ?Sized>(
+    store: &S,
+    predecessor: &DelegateKey,
+) -> bool {
+    store.get_secret(&pred_done_marker(predecessor)).as_deref()
+        == Some(PRED_DONE_MARKER_VALUE_EMPTY)
+        && store
+            .get_secret(&pred_wip_marker(predecessor))
+            .is_some_and(|v| v != PRED_DONE_MARKER_VALUE_EMPTY)
 }
 
 /// Reconstruct a completed predecessor migration's data/empty state from its
@@ -697,10 +742,16 @@ pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
 /// Public so an implementer of the marker contract — a node-side copy-forward, or
 /// an app implementing [`crate::SuccessorSecretsIo`] over its own storage — can read
 /// back the same data/empty flag [`predecessor_done_marker`] writes.
+///
+/// An empty completion marker beside an in-progress marker that saw data reads as
+/// `None`: the empty seal was contradicted by an import started after it.
 pub fn predecessor_migration_had_data<S: SecretStore + ?Sized>(
     store: &S,
     predecessor: &DelegateKey,
 ) -> Option<bool> {
+    if empty_seal_contradicted(store, predecessor) {
+        return None;
+    }
     store
         .get_secret(&pred_done_marker(predecessor))
         .map(|v| v != PRED_DONE_MARKER_VALUE_EMPTY)
@@ -778,8 +829,10 @@ pub(crate) fn pred_done_marker(predecessor: &DelegateKey) -> Vec<u8> {
 /// `pred-done` marker means "this exact migration completed," never "an ancestor's
 /// data is transitively present"), so a later chained migration behaves the same
 /// however each generation was migrated. (The app path additionally leaves a
-/// crate-internal `pred-wip` marker behind; that is not part of the shared
-/// completion contract and is never read once the `pred-done` marker exists.)
+/// crate-internal `pred-wip` marker behind. It is read beside an EMPTY
+/// `pred-done` marker: a `pred-wip` that saw data there means an import started
+/// after the empty seal, which the seal does not outrank — see
+/// [`crate::SuccessorSecretsIo::migration_marker`].)
 pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Vec<u8>, Vec<u8>) {
     let value = if had_data {
         PRED_DONE_MARKER_VALUE_DATA
@@ -791,7 +844,17 @@ pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Ve
 
 /// Whether `key` is in this crate's reserved marker namespace.
 pub(crate) fn is_marker(key: &[u8]) -> bool {
-    key.starts_with(MARKER_NS)
+    key.starts_with(MARKER_NS) || key.starts_with(JOURNAL_NS)
+}
+
+/// Whether `key` is reserved by the crate (a migration marker, or the
+/// migration journal): never an app's data, never exported, never imported. An
+/// app that copies predecessor data itself (a hand-rolled sweep, an adapter
+/// listing a predecessor's keys) should skip these too. It knows only the
+/// crate's namespaces: an app storing its journal under its own key (overriding
+/// [`crate::JournaledSuccessorIo::journal_key`]) must skip that key itself.
+pub fn is_reserved_key(key: &[u8]) -> bool {
+    is_marker(key)
 }
 
 /// The in-progress marker key for a source generation.
@@ -1663,12 +1726,12 @@ mod tests {
     }
 
     #[test]
-    fn import_predecessor_retry_preserves_data_flag_after_incomplete() {
+    fn import_predecessor_data_then_empty_retry_is_not_sealed() {
         // P1 retry-flip (exact Codex order): attempt 1 is data-bearing but a write
-        // FAILS (Incomplete); the retry's re-export is EMPTY. The completion marker
-        // must stay DATA-bearing (preserved from the WIP marker written on attempt
-        // 1), NOT flip to empty — otherwise the predecessor would lose its
-        // NewestSnapshotWins authority on a later re-run.
+        // FAILS (Incomplete); the retry's re-export is EMPTY. That must neither
+        // flip the predecessor to empty (it would lose its NewestSnapshotWins
+        // authority) nor seal it over the missing key (freenet/freenet-migrate#38):
+        // it stays in progress until the data comes back.
         let key = dk(2);
         let mut store = MemStore::default();
         store.fail_writes_to(b"x");
@@ -1684,10 +1747,31 @@ mod tests {
             "no done marker yet"
         );
 
-        // Retry with an EMPTY re-export (the old delegate lost its data meanwhile).
+        // Retry with an EMPTY re-export: not believed (a frozen predecessor does
+        // not lose data; a failed read looks the same). Nothing is sealed, and the
+        // in-progress data flag survives.
         let retry = import_predecessor_secrets_once(&mut store, &key, &[]);
-        assert!(matches!(retry, PredecessorImportOutcome::Imported { .. }));
-        assert!(predecessor_already_migrated(&store, &key));
+        assert_eq!(
+            retry,
+            PredecessorImportOutcome::Incomplete {
+                imported: 0,
+                skipped: 0,
+                failed: 0
+            }
+        );
+        assert!(
+            !predecessor_already_migrated(&store, &key),
+            "an empty answer must not seal over the missing `x`"
+        );
+
+        // The data comes back: it imports, and the seal is data-bearing.
+        store.stop_failing();
+        let again =
+            import_predecessor_secrets_once(&mut store, &key, &[(b"x".to_vec(), b"vx".to_vec())]);
+        assert!(matches!(
+            again,
+            PredecessorImportOutcome::Imported { imported: 1, .. }
+        ));
         assert_eq!(
             predecessor_migration_had_data(&store, &key),
             Some(true),
@@ -1809,5 +1893,65 @@ mod tests {
         );
         let checked = predecessor_delegate_keys_checked(&params, &lineage).unwrap();
         assert_eq!(checked[0].bytes(), recorded_key);
+    }
+
+    // ---- round-7 probes: the journal namespace at every is_marker caller ----
+
+    #[test]
+    fn r7_export_withholds_the_journal_key() {
+        let mut store = v1_store();
+        store.set_secret(crate::MIGRATION_JOURNAL_KEY, b"journal-bytes");
+        let origin = MessageOrigin::WebApp(ContractInstanceId::new([7u8; 32]));
+        let msgs = handle_export_request(
+            &store,
+            Some(&origin),
+            &OriginPolicy::Any,
+            &whole_scope(),
+            &ExportRequest {
+                source_generation: 2,
+            },
+        )
+        .unwrap();
+        let exported = extract_exported(&msgs);
+        assert_eq!(exported.secrets.len(), 3);
+        assert!(exported
+            .secrets
+            .iter()
+            .all(|(k, _)| k.as_slice() != crate::MIGRATION_JOURNAL_KEY));
+    }
+
+    #[test]
+    fn r7_import_secrets_once_never_writes_a_journal_key() {
+        let exported = ExportedSecrets {
+            source_generation: 1,
+            secrets: vec![
+                (b"rooms_data".to_vec(), b"R".to_vec()),
+                (crate::MIGRATION_JOURNAL_KEY.to_vec(), b"forged".to_vec()),
+            ],
+        };
+        let mut store = MemStore::default();
+        import_secrets_once(&mut store, &exported, 2).unwrap();
+        assert!(store.has_secret(b"rooms_data"));
+        assert!(!store.has_secret(crate::MIGRATION_JOURNAL_KEY));
+    }
+
+    #[test]
+    fn r7_import_predecessor_journal_only_payload_is_empty_not_data() {
+        let key = dk(3);
+        let mut store = MemStore::default();
+        let out = import_predecessor_secrets_once(
+            &mut store,
+            &key,
+            &[(
+                crate::MIGRATION_JOURNAL_KEY.to_vec(),
+                b"their-journal".to_vec(),
+            )],
+        );
+        assert!(!store.has_secret(crate::MIGRATION_JOURNAL_KEY));
+        assert_eq!(
+            predecessor_migration_had_data(&store, &key),
+            Some(false),
+            "{out:?}"
+        );
     }
 }

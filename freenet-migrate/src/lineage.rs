@@ -58,7 +58,12 @@ impl ContractLineageEntry {
 /// One predecessor generation of a *delegate*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegateLineageEntry {
-    /// Monotonic generation number (older = smaller).
+    /// Monotonic generation number (older = smaller). Never change it for an
+    /// existing predecessor once a successor may hold generation-keyed markers
+    /// from [`crate::import_secrets_once`] (any version): those are keyed by the
+    /// export's `source_generation`, which must keep matching this number. A
+    /// renumber points them at a different predecessor, which can then read as
+    /// migrated without ever being imported, or hide an import under way.
     pub generation: u32,
     /// The 32-byte code hash `blake3(wasm)`, decoded at build time.
     pub code_hash: [u8; 32],

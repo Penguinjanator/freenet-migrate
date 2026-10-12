@@ -202,6 +202,25 @@ evolution could carry generations/policy). The earlier "`NodeCopyForward: impl
 SecretTransport` drop-in routed inside migrate" framing was non-viable (the io
 reaches predecessors, not the node) and is retired.
 
+**Completeness across predecessors (0.7.0, #37).** The two-phase marker makes
+one predecessor's import durable. Whether *every* predecessor has been dealt with
+is a separate durable record, the `MigrationJournal`, stored in the successor
+through `JournaledSuccessorIo`, with `begin_migration_journal` called on every
+load (see the `journal` module
+docs for the resolution table). It composes with the hand-off above: a node-side
+copy-forward that writes `predecessor_done_marker`s makes the journaled walk see
+`AlreadyMigrated`, which resolves from the marker's `had_data`, so every
+predecessor the copy reached resolves with no app change. (One the node never had
+stays pending, as always.) Absence (silence or "not installed") never
+resolves a journal entry, for the same reason it never seals a marker.
+
+A node copy-forward that copied a predecessor's raw secrets would carry its
+`MIGRATION_JOURNAL_KEY` too (only the crate filters that namespace, not the
+node), installing the predecessor's journal as the successor's when the
+successor has none. That is mostly benign (the journal's data travels with it,
+and the predecessor's own entry is absent, so it reads pending), but the copy
+should exclude the namespace (#40).
+
 Hosted per-user secrets stay un-migratable at rest even under a node-mediated
 copy (their DEK keying material is the user's secret, deliberately not the node
 KEK), so the crate returns `MigrateError::UserScopeNotAtRest` and documents the
@@ -243,7 +262,10 @@ predecessor rule is manual-only today — a real hardening). Its "cover every
 
 ## Status
 
-Published: `freenet-migrate` **0.5.0** and `freenet-migrate-build` **0.2.0**.
+Published: `freenet-migrate` **0.6.0** and `freenet-migrate-build` **0.2.0**;
+0.7.0 (unreleased) adds `NewestSnapshotWinsContinuePastUnresponsive`, the
+completeness journal, and one behaviour change in the delegate walk (an empty
+export after data was seen is a silence, not a seal).
 The two halves version independently. The reusable core machinery + tests,
 **field-validated by River's 0.6 → 0.8 re-key** (above).
 
@@ -259,6 +281,6 @@ retirement. Both apps run the crate alongside their pre-existing hand-rolled
 sweeps during a deliberate dual-running period rather than replacing them
 outright.
 
-There are five adopters in total. `README.md`'s Status section carries the
+There are six adopters in total. `README.md`'s Status section carries the
 per-app breakdown of which half each one takes. Targets current stdlib
 **0.8.x**.

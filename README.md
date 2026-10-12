@@ -679,6 +679,125 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
 > neither transport (the interim path is async and uncorrelated; the node path
 > returns nothing app-side).
 
+#### Knowing when the migration is done: the journal (0.7.0, opt-in)
+
+The walk is durable within a predecessor, but an app also needs a durable answer
+to "has every predecessor been dealt with?" on every load, without re-probing
+them all. In a browser app served by the gateway there is no `localStorage`, and
+a tab can die between any two writes, so that answer cannot come from session
+state (freenet/river#760). Store a `MigrationJournal` in the successor instead:
+
+```rust,ignore
+// Load path. `begin` on EVERY load, before anything migrated is written: it
+// starts the journal, adds lineage entries it has never seen, and reopens a
+// resolution a lost flag left wrong (all read off the markers). An Err means: do
+// not write anything migrated this load. `load_journal` must answer Err (not
+// None) for a read that timed out.
+let begun = begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
+if !begun.is_complete() {
+    // Writing migrated data yourself, outside the walk? Flag it first, once you
+    // hold data read from the predecessor and before you write or merge it.
+    // Flagged: write. AlreadyImported: nothing recorded; write again (unflagged)
+    // if your merge cannot resurrect a deleted key, since skipping leaves any gap
+    // for good. Any other variant: do not write. Err: skip it (and, under a
+    // snapshot policy, every older one) this load:
+    // match note_app_import_started(&mut successor, DELEGATE_LINEAGE, &predecessor, &policy).await { .. }
+    let run = migrate_delegate_secrets_journaled(
+        &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
+    ).await;
+    // `run.status` is the stored journal's status (plus any marker it could not
+    // read, as an import under way). While it is incomplete, run again on a
+    // later load.
+}
+// Decide from the status the LAST call returned: `run.status` (None means
+// possibly incomplete), or `begun` when the walk did not run. Not from a raw
+// `journal_status` read, which reads no markers. `interrupted_import()` true
+// means: do NOT treat the successor as everything the user had. False does not
+// mean it is: check `rejected_items()` and the pending list too. Never gate on
+// `!is_complete()`.
+```
+
+`successor` implements `JournaledSuccessorIo`: load and store the journal bytes
+under `MIGRATION_JOURNAL_KEY` in the successor's secrets (a node accepts the key;
+the crate withholds it from every walk and export, and `is_reserved_key` tells
+your own code the same; the crate ships no delegate-side store), and an
+`import_revision` you bump with every change to how your import path decodes
+items. Its marker store must follow the three-rule
+marker contract on `SuccessorSecretsIo::migration_marker` / `record_marker` (see
+the CHANGELOG): break it and a lost journal certifies `Complete` over a partial
+copy. The crate refuses, rather than trusts, a store that visibly breaks it.
+Drive the journal calls one at a time within a session.
+
+**Do not adopt the journal unless** your `fetch_secrets` fails loudly (a
+resolution is as permanent as a `Done` marker, so an export that can come back
+partial without an `Err` gets a partial import certified complete; that includes
+a shorter answer on a retry, and an index a failed read turns into a short
+list), your
+successor store is durable, your marker store follows the contract, your
+predecessors are frozen, no older build of your app walks the same successor,
+and, under a snapshot policy, every predecessor finished its own migration
+before it became one (see the CHANGELOG).
+
+Compose "the successor may not be everything the user had" from: a walk in
+flight, a status not read yet, `begin_migration_journal` erring, a walk whose
+`status` is `None`, `interrupted_import()` on the status the last call
+returned, or `rejected_items() > 0` (items the successor's import path refused,
+missing until a fix raises `import_revision`).
+
+Per load, `begin` reads the journal and one marker per predecessor resolved as
+holding nothing; it stores only when it reopens or adds an entry. A marker it
+cannot read there refuses nothing: that predecessor reads as an import under way
+for the load, and the read is retried on the next. (Starting a journal, or adding
+a lineage entry, still refuses until that predecessor's marker reads; and the
+walk halts at a predecessor not resolved with its data whose marker it cannot
+read.) The walk then
+costs what the section below says.
+
+What resolves a predecessor is a table in the `journal` module docs. The short
+version: silence and "not installed" never do; a permanent rejection does, with a
+count, until `import_revision` rises; a generation skipped behind a halt does not;
+and once an import from a predecessor has started, an answer that it holds
+nothing is not believed.
+
+So `Complete` needs every predecessor in the lineage to answer, and one this node
+never had keeps the journal `Incomplete` indefinitely: the walk keeps asking it on
+every run. Implement `PredecessorSecretsIo::probe_verdict` if your transport can
+tell a definitive "not installed" from silence. That makes each such probe
+immediate, though every walk still reads the marker of each predecessor not
+already resolved with its data, and stores
+the journal; only running the walk less often (a cadence) makes a lineage of
+absent generations cheap. It also lets `JournalStatus::pending_all_absent(n)` tell you that every
+remaining predecessor has answered "not installed" `n` times in a row, if you
+want to run the walk less often. Treat that as a rate limit, never a seal:
+"not installed" can also mean the node failed to read the delegate. The crate
+keeps no clock, so a cadence is the app's to count (loads, say, kept in its own
+successor state).
+
+`interrupted_import()` can stay true indefinitely: a predecessor an import
+started from that never answers with data again (it was unregistered, it really
+did become empty, or a snapshot policy later superseded it, which under
+`NewestSnapshotWinsContinuePastUnresponsive` follows from an ordinary transient
+silence of the newest generation while an older one was being imported; a
+rejection reopened by a higher `import_revision` that a snapshot policy then
+supersedes counts too) is never resolved, and so is a predecessor whose marker
+can never be read; the crate has no call to abandon
+it yet ([#39](https://github.com/freenet/freenet-migrate/issues/39)). An app that
+gates something on `interrupted_import()` must be able to live with that, with
+an override that ignores the flag rather than one that resolves an entry.
+
+Nor does `interrupted_import()` cover a predecessor that has never answered: it
+may hold everything the user had, with nothing partially written. It shows as a
+pending entry with no import flag (`absent_streak` 0 if it was silent rather
+than "not installed"). Whether that blocks anything (a fresh install, say) is the
+app's rule to state, from the pending list. Inside the no-compare-and-swap window
+between two sessions' journal stores, a stale session can also overwrite an
+app's flag: the stored journal can then say no import is under way over a
+partial copy, and if the predecessor had been resolved as holding nothing, it
+can even read `Complete`. Its marker still records the import. The next `begin`
+reopens such a resolution, and the walk restores the flag on any predecessor it
+reaches and, after it, on any whose marker neither it nor the start read, so
+the status those calls return reports it.
+
 ### Known limitations
 
 - **`ExportedSecrets` is not authenticated.** Its `source_generation` is echoed
@@ -704,6 +823,8 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
   it is per-node registration/availability.) A predecessor the reached node never
   registered is indistinguishable from a broken one — both surface as
   `Unresponsive`, which the app must show rather than silently fresh-installing.
+  A `probe_verdict` answering "not installed" (0.7.0) is reported the same way;
+  it only feeds the journal's absent streak.
   The node-side copy-forward removes the dependency by reading storage directly.
 
 ## Building & testing
@@ -739,35 +860,44 @@ leaving the contract-side surface untouched. 0.7.0 adds
 `SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`, an opt-in
 fix for `NewestSnapshotWins` halting on the *first* silent predecessor — the
 common case, not the rare one — which disabled migration in practice for any
-lineage longer than one generation ([#14]).
+lineage longer than one generation ([#14]), and a durable completeness
+journal so an app knows when every predecessor has been dealt with ([#37]).
 
-**Published:** `freenet-migrate` **0.5.0**, `freenet-migrate-build` **0.2.0**.
+**Published:** `freenet-migrate` **0.6.0**, `freenet-migrate-build` **0.2.0**.
 The two halves version independently, so an app can take one without the other.
 Targets current stdlib **0.8.x**.
 
-**Unreleased: 0.6.0**, breaking on the **contract** half — silence is no longer
-absence ([#19]). Four of the five adopters below need a code change, three of
-them to compile at all. See [Upgrading to 0.6.0](#upgrading-to-060) and the
+**0.6.0** (published 2026-08-13) is breaking on the **contract** half — silence
+is no longer absence ([#19]). See [Upgrading to 0.6.0](#upgrading-to-060) and the
 CHANGELOG.
 
-**Unreleased: 0.7.0**, additive on the **delegate** half — the new
-`NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]). No
-adopter below needs a code change: every known adopter constructs
-`SecretSelectionPolicy` rather than exhaustively matching it, so a new variant
-does not break compilation. Adopting it is optional per app.
+**Unreleased: 0.7.0** (publish gated on
+[#43](https://github.com/freenet/freenet-migrate/issues/43)), on the **delegate** half: the new
+`NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]) and the
+opt-in completeness journal ([#37]), both optional per app, plus one behaviour
+change every adopter of the delegate walk gets. A predecessor that exports
+nothing although an earlier attempt saw data is now reported `Unresponsive`
+instead of being sealed as done (see the CHANGELOG before upgrading). Nothing
+needs a code change to compile: every known adopter constructs
+`SecretSelectionPolicy` rather than exhaustively matching it, the new
+`WriterStage::JournalFlag` and `JournalUnavailable` variants join a
+`#[non_exhaustive]` enum, and the journal and `probe_verdict` are new API with
+defaults.
 
 ### Adopters
 
 The adoption tracked by
 [freenet/river#398](https://github.com/freenet/river/issues/398) has landed.
-Five apps now use the crate, and both halves have adopters.
+Six apps now use the crate, and both halves have adopters. Pins as of
+2026-10-11:
 
 | App | `freenet-migrate` | `freenet-migrate-build` | Migrates |
 |-----|-------------------|-------------------------|----------|
-| [River](https://github.com/freenet/river) | 0.5 | 0.2 | delegate + contract |
-| [Delta](https://github.com/freenet/delta) | 0.5.0 | none | delegate + contract |
+| [River](https://github.com/freenet/river) | 0.5 (UI), 0.6 (`riverctl`) | 0.2 | delegate + contract |
+| [Delta](https://github.com/freenet/delta) | 0.6 | none | delegate + contract |
 | [ghostkeys](https://github.com/freenet/ghostkeys) | 0.5.0 | none | delegate |
-| [Atlas](https://github.com/freenet/atlas) | 0.5.0 | 0.2.0 | contract |
+| [Atlas](https://github.com/freenet/atlas) | 0.6 | 0.2.0 | contract |
+| [Harvest](https://github.com/freenet/harvest) | 0.6 | 0.2 | delegate + contract |
 | [freenet-git](https://github.com/freenet/freenet-git) | none | 0.2.0 | contract (registry codegen) |
 
 River and Delta each run the crate alongside the hand-rolled sweep they
@@ -866,3 +996,4 @@ LGPL-3.0-only. See [LICENSE](./LICENSE).
 [#19]: https://github.com/freenet/freenet-migrate/issues/19
 [#8]: https://github.com/freenet/freenet-migrate/issues/8
 [#14]: https://github.com/freenet/freenet-migrate/issues/14
+[#37]: https://github.com/freenet/freenet-migrate/issues/37

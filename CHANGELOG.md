@@ -2,15 +2,37 @@
 
 ## freenet-migrate 0.7.0
 
-**Additive, delegate half only.** New
-`SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
-([#14](https://github.com/freenet/freenet-migrate/issues/14)). The minor version
-bump (not a patch) is the conventional pre-1.0 signal for a new public enum
-variant — `SecretSelectionPolicy` is not `#[non_exhaustive]` before this
-release (it is now), so an external exhaustive `match` over it, though none is
-known to exist, would need a new arm. This is a version-number convention, not
-a behavior change: no known adopter's code needs to change, since every one of
-them constructs the policy rather than matching it exhaustively.
+**Unreleased; publish gated on #43** (River's real-node rehearsal, the #41
+marker-store conformance check, #39 or an app override, and whether this ships
+as 0.7.0 or 0.8.0).
+
+**Delegate half only.** Two features and one behaviour change:
+
+* `SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
+  ([#14](https://github.com/freenet/freenet-migrate/issues/14)), below.
+* A durable, opt-in **completeness journal**
+  ([#37](https://github.com/freenet/freenet-migrate/issues/37)), so an app knows
+  on every load whether every predecessor has been dealt with. See "Durable,
+  verifiable migration completeness" below.
+* **Behaviour change, for every adopter of the delegate walk:** a predecessor
+  that exports nothing although an earlier attempt saw data in it is no longer
+  sealed as done. See "An empty answer after data is a silence" below; read it
+  before upgrading if your app keys anything off the walk's `Done` markers or
+  relies on the walk halting.
+
+The minor version bump (not a patch) is the conventional pre-1.0 signal for new
+public enum variants. `SecretSelectionPolicy` was not `#[non_exhaustive]` before
+this release (it is now), so an external exhaustive `match` over it, though none
+is known to exist, would need a new arm; that is technically breaking.
+`WriterStage::JournalFlag` and `WriterStage::JournalUnavailable` join an enum that
+was already `#[non_exhaustive]`.
+No known adopter's code needs to change to compile: every one constructs the
+policy rather than matching it exhaustively, and the journal is new API. The
+behaviour change above is the one thing to audit.
+
+**Upgrading from 0.5.** 0.6.0 (the contract half: silence is no longer absence)
+sits between, and is breaking on the contract half. Read "Upgrading to 0.6.0" in
+the README first.
 
 ### The problem
 
@@ -75,6 +97,283 @@ opt-in. Both the closed case and the accepted residual are pinned by tests:
 `a_predecessor_proven_data_bearing_by_a_surviving_marker_still_halts_when_later_unresponsive`
 and
 `continue_past_unresponsive_can_permanently_shadow_a_later_recovered_true_value`.
+
+### Durable, verifiable migration completeness ([#37](https://github.com/freenet/freenet-migrate/issues/37))
+
+**Opt-in.** Apps that do not call the journal API get nothing new from this
+section. (The walk's one behaviour change, which every adopter gets, is in its own
+section below.)
+
+**The problem.** The walk was already durable *within* a predecessor (in-progress
+marker before the first item, done marker after the flush). What nothing recorded
+durably was whether *every* predecessor had been dealt with, which an app has to
+answer on every load to decide whether the walk must run again. Apps answered it
+in-session (quiescence of the probe fan-out, in-flight counters, a `localStorage`
+flag), and in a browser app served by the gateway every one of those fails: the
+app iframe has no `localStorage`, and a tab can die between any two writes.
+freenet/river#760 measured it: a tab closed after the first per-room write left 1
+of 4 rooms on every later load. Four review rounds of in-session fixes
+(freenet/river#758) each found a new hole, because "done" was still a guess.
+
+**The fix.** A `MigrationJournal`, stored in the successor through the new
+`JournaledSuccessorIo` trait, lists every predecessor as `Pending` or
+`Resolved`:
+
+* `begin_migration_journal` stores it before the app's first migration write.
+  It never resets a readable journal. A fresh one, and any lineage entry an
+  existing one has never seen, is read off the migration markers: a `Done`
+  resolves as the walk would, and `InProgress { saw_data: true }` is an import
+  `Started`.
+* `migrate_delegate_secrets_journaled` runs the ordinary walk, durably flags a
+  data-bearing predecessor's import as started before its first item, and
+  records what each predecessor resolved to. It does not walk a predecessor
+  again once the journal resolves it with its data in the successor (an import
+  whose only blemish was permanent rejections has no `Done` marker). A refused
+  run reports every predecessor `WriterUnavailable`
+  (`WriterStage::JournalUnavailable`), so it never reads complete.
+* `note_app_import_started(successor, lineage, predecessor, policy)` raises the
+  same flag for an app that writes migrated data outside the walk (River's
+  hand-rolled sweep), once it holds data read from the predecessor and before
+  it writes or merges it. It takes the same lineage as `begin` and the walk,
+  which decides the predecessor's generation and which ones are newer (never
+  the stored journal, which a tab on another build may have numbered
+  differently). It refuses (`JournalError::NotImportable`) a predecessor outside
+  the lineage, or one a snapshot policy supersedes: a newer generation holds
+  data by the journal (resolved with it, an import under way, or a rejection a
+  higher revision reopened) or by its own marker, or only a legacy seal for a
+  newer generation covers it. Under plain `NewestSnapshotWins` it also refuses,
+  for now, one behind a newer generation that has not answered that it holds
+  nothing (the walk halts there too; if that generation never answers, neither
+  clears). Under the continue-past policy it refuses only a newer generation it
+  knows holds data, while the walk asks first: a sweep reads newer generations
+  itself, newest first, and stops at the first that holds data or errs. A
+  marker read that fails there is a plain `Successor` error, never a verdict.
+  Treat every `Err` alike: skip the predecessor now, try again on a later load,
+  and under a snapshot policy skip every older one for this load too.
+* On success it returns `AppImport::Flagged` (write the data) or, for a
+  predecessor whose import already completed (a `Done` seal with data, or
+  resolved with data under the binding), `AppImport::AlreadyImported` with
+  nothing recorded (including when the flag's own store brings in another
+  session's completion). The walk will not offer that one again. Its data can
+  still be partial, or missing altogether (a short export, #44; an old tab's
+  writes during a rollout; items the import path rejected; a legacy seal that
+  never covered it). Writing it again, unflagged, fills that gap but also
+  brings back keys deleted since; skipping it leaves the gap for good, and no
+  status reports it (except rejected items, which `rejected_items()` counts). An app whose merge cannot resurrect a deleted key writes
+  it again, as should one that can tolerate a resurrected key; any other skips
+  it and logs that it did. `AppImport` is `#[must_use]` and `#[non_exhaustive]`:
+  treat a variant you do not know as "do not write".
+* Inside the no-compare-and-swap window between two sessions' stores, a stale
+  session can overwrite an app's flag, and the stored journal can then say no
+  import is under way over the app's partial copy (even `Complete`, if the
+  predecessor had been resolved as holding nothing). The predecessor's marker
+  still records the import: `begin_migration_journal` reopens such a resolution,
+  and the walk restores the flag on any predecessor it reaches, and after it on
+  any whose marker neither it nor the start read (behind a halt, a failed read,
+  a legacy seal, a supersession). Call `begin` on every load, and decide from
+  the status the last call returned, never from a raw `journal_status` read.
+  The same window lets a walk's flag store bring in another session's
+  completion and still write its items (under a never-clobber writer, the same
+  data; only a key deleted inside the window comes back), and lets
+  `note_app_import_started` flag a predecessor another session made superseded
+  in the meantime under a snapshot policy (the app's write can shadow the newer
+  values, and the flag never clears).
+* `begin` costs one marker read per predecessor resolved as holding nothing, per
+  call. A marker it cannot read there refuses nothing: the predecessor reads as
+  an import under way for that load, nothing is stored, and the read is retried
+  on the next.
+* `JournalStatus` is `NotStarted`, `Unreadable`,
+  `Incomplete { pending, rejected_items }` (re-run the walk) or
+  `Complete { rejected_items }` (nothing left to probe). Decide from the one
+  `begin` or the walk returned; `journal_status` is a pure read of stored bytes
+  that reads no markers.
+  `interrupted_import()` says the successor may hold a partial copy right now.
+  True means "do not treat the successor as everything the user had"; false
+  does not mean it is (a silent predecessor, or `rejected_items() > 0`, still
+  says otherwise). Never gate on `!is_complete()`, which absent generations keep
+  true for ever.
+
+**Store it in the successor's secrets under `MIGRATION_JOURNAL_KEY`**
+(`\0freenet-migrate-journal/v1`). That namespace is the crate's, not the
+node's: a node refuses any key in the marker namespace `\0freenet-migrate/` that
+is not a marker, but accepts this one. Every walk, the plain one included, and
+`handle_export_request` withhold it, so a predecessor's journal is never
+imported nor counted as its data; `is_reserved_key` tells an app's own code the
+same. Keep it out of any copying your app does itself (a hand-rolled sweep).
+The crate does not ship a delegate-side store (`SecretStoreIo` does not
+implement `JournaledSuccessorIo`; #40).
+
+This reserves a second namespace for every adopter, not only journal users: a
+key beginning with `\0freenet-migrate-journal/` is never exported or imported.
+
+**Do not adopt the journal unless:**
+
+* **your `fetch_secrets` fails loudly.** A resolution is as permanent as a `Done`
+  marker, so an export that can come back partial without an `Err` (one that
+  silently skips what it cannot read, or a sub-request whose timeout reads as
+  "nothing", as in freenet/delta#100) gets a partial import certified complete.
+  That includes a shorter answer on the retry after an interrupted import (only
+  an empty one is refused, #44), and an index the predecessor reads for itself
+  that a failed read (freenet-core#5857) turns into a short list;
+* **your successor store is durable** (a page-memory marker store cannot hold a
+  journal);
+* **your marker store follows the new contract** below;
+* **your predecessors are frozen**: nothing writes to an old generation once its
+  successor is in use, or `Imported` and `NoData` seal over data written later;
+* **no older build of your app walks the same successor** while the journaled
+  one is in use (old tabs during a UI-only rollout): it still seals over partial
+  copies the journal then believes. Ship the journal with a delegate re-key.
+  (Even then, an old tab keeps writing to what is now a predecessor until it is
+  closed, so "frozen" holds only after the rollout; data written there in the
+  window is the app's to reconcile.)
+* **under a snapshot policy, every predecessor finished its own migration**
+  before it became one. A newer predecessor that was itself interrupted
+  mid-migration is still taken as the authoritative snapshot, and what it never
+  received from older generations is not asked for. Union does not have this
+  limit.
+
+**`import_revision` is part of adopting, not optional.** Any change to how the
+import path decodes items (River's byte-string change, say) must bump it, or
+predecessors it rejected before stay resolved and their items stay missing.
+
+`Complete` needs every predecessor resolved, and a predecessor that is not
+installed on the node never resolves. An account whose lineage includes
+generations this node never had therefore stays `Incomplete`, and the walk keeps
+probing them; with a typed "not installed" answer each probe is cheap.
+`pending_all_absent(n)` lets an app probe less often, as its own policy.
+
+Completeness is arithmetic over durable state; there is no timing anywhere in it.
+The rules the data-loss argument rests on:
+
+* **Absence never resolves.** Silence, a timeout, and a definitive "not
+  installed" all stay pending: freenet-core unregisters a delegate without
+  deleting its secrets, so "not installed" is not proof of "holds nothing". A
+  "not installed" answer is counted (`absent_streak`); the crate never gives up.
+* **"Nothing" after "something" is not believed.** A predecessor whose import
+  `Started` and which then answers that it holds nothing stays pending. (The
+  walk itself now does the same; see below.)
+* **A permanent rejection resolves with a count, and can be reopened** when the
+  writer's `JournaledSuccessorIo::import_revision` rises, so an app that finds
+  and fixes a wrong rejection retries it. An older build of the app never
+  downgrades the revision.
+* **`SupersededByAuthoritative` holds only under a snapshot policy.** Under
+  `UnionAllGenerations` it reads as pending. Both this and the revision are
+  evaluated against the app's `JournalBinding` on every read and every merge,
+  so a stale stored copy cannot bring a reopened resolution back.
+* **Every store is read-merge-write and fails closed.** A second session's import
+  flag survives our store, including the very first store. If the journal, or a
+  predecessor's marker while starting one, cannot be read, or the journal cannot
+  be started or (before a predecessor's first item) flagged, nothing of that
+  predecessor is written. A journal from a different encoding version is never
+  overwritten; a corrupt or lost one is rebuilt from the migration markers.
+* **Markers back every started import.** `note_app_import_started` also writes
+  the predecessor's `InProgress { saw_data: true }` marker, so a rebuilt journal
+  still knows about every import that started, the app's included.
+
+**The marker-store contract, for journal adopters** (on
+`SuccessorSecretsIo::migration_marker` / `record_marker`; `SecretStoreIo`
+follows it). The compiler does not check it, and River's, Harvest's and Delta's
+own stores do not follow it today:
+
+1. `InProgress { saw_data: true }` stored beside `Done { had_data: false }` reads
+   as `InProgress { saw_data: true }`.
+2. Recording `InProgress` never erases a stored `Done` (keep them separate).
+3. `InProgress { saw_data: false }` never downgrades a stored
+   `InProgress { saw_data: true }`, including one another session records
+   between your check and your write: do both inside one delegate message, or
+   the check does not hold.
+
+Break rule 1 and a lost or corrupt journal certifies `Complete` over a partial
+copy. The crate checks rule 1 where it matters (`note_app_import_started` and a
+walk re-asking an empty seal read the marker back after recording it, and refuse
+with nothing written if it does not read as recorded); it checks rule 3
+nowhere. A conformance check adopters can run is tracked in #41.
+
+`predecessor_already_migrated` and the public `predecessor_migration_had_data`
+follow rule 1 too: an empty seal contradicted by a data in-progress marker reads
+as not migrated (`None`).
+
+New `WriterStage` variants: `JournalFlag` (a failed import-flag store; nothing
+of that predecessor was written) and `JournalUnavailable` (the journaled walk was
+refused).
+
+**`ProbeVerdict` and `PredecessorSecretsIo::probe_verdict`.** A new default trait
+method with a third answer, `NotInstalled`, for an adapter whose transport can tell
+"this node has no such delegate" from silence (a typed node error, never a
+timeout or an empty reply). The default forwards to `probe_executable` and never
+answers `NotInstalled`, so existing adapters are unaffected. The walk treats
+`NotInstalled` exactly like silence (`Unresponsive`, same termination rule under
+every policy); the only difference is the journal's absent streak.
+
+
+### An empty answer after data is a silence (behaviour change, every adopter)
+
+A predecessor whose in-progress marker says an earlier attempt saw data, and
+which now exports nothing, is reported `Unresponsive` (with
+`PredecessorMigration::exported_nothing_after_data()` true) and keeps its
+in-progress marker. Before, it was sealed `Done { had_data: true }`, and the
+interrupted attempt's missing items were never asked for again.
+`import_predecessor_secrets_once` likewise returns `Incomplete` with zero counts
+instead of sealing.
+
+**Why.** A frozen predecessor does not lose data, so the empty answer is the
+fault: freenet-core reports a secret it failed to read the same way as one that
+is not there (freenet/freenet-core#5857).
+
+**What changes for an adopter.**
+
+* **No data is dropped.** What was a silent seal is now a retry on every run.
+* **A predecessor that really did become empty is retried forever.** That
+  includes one an old-version tab emptied, so "frozen" is an assumption your app
+  must actually hold.
+* **Termination follows each policy's rule for an unresponsive predecessor, with
+  the earlier data as evidence:**
+  * `NewestSnapshotWins` and `...ContinuePastUnresponsive` stop there.
+  * `UnionAllGenerations` goes on to older generations, as for any unresponsive
+    predecessor, and a never-clobber writer may then keep an older generation's
+    value for a key the newer one also holds (an opt-in halt is tracked in #42).
+* **If your app relies on the walk halting there under Union**, it has to do it
+  in its adapter: once a predecessor exports nothing while the successor's
+  marker for it says `InProgress { saw_data: true }`, return `Err` from
+  `fetch_secrets` for every OLDER predecessor for the rest of that run. (Erring
+  for the empty one alone changes nothing: Union walks past any unresponsive
+  predecessor.) `exported_nothing_after_data()` reports the case afterwards, by
+  which time an older generation may already have been written.
+* **If your app keys anything off the predecessor's `Done` marker** (promoting
+  staged records when it is written, say), that now waits until the predecessor
+  answers with data again.
+* **Seals written by earlier releases stay as they are,** and an older build
+  still running against the same successor (an old tab during a UI-only
+  rollout) keeps writing them, and reads the new contradicted-seal pair as a
+  plain empty `Done`. A predecessor sealed `Done { had_data: true }` over a
+  partial copy cannot be told apart from a complete one. Ship the journal with
+  a delegate re-key, or accept that window knowingly.
+* **Do not renumber a lineage over a successor holding legacy generation-keyed
+  markers.** Those markers (from the generation-keyed `import_secrets_once`, any
+  version) are keyed by the export's generation, under every policy's bridge, so a renumber points them at
+  a different predecessor: one can then read as migrated without ever being
+  imported, or hide an import under way, and the journal certifies it. A
+  successor that only ever saw the per-predecessor markers does not have this
+  problem. Under a snapshot policy, inserting a forgotten data-bearing
+  generation between two already resolved is a different hazard: the older one
+  was imported as the authoritative snapshot, and the walk does not revisit it.
+  So is an older build, whose lineage lacks the new generation, walking the
+  same successor during the rollout: ship a lineage change with a delegate
+  re-key.
+* **A legacy generation-keyed import (`import_secrets_once`) interrupted part-way
+  is invisible to the journal,** which reads only the per-predecessor markers.
+  Do not mix the two APIs on one successor. A legacy at-or-above seal (a
+  generation-keyed marker for a NEWER generation) is journalled as superseded,
+  never as imported, so it reopens under Union.
+* **A lost journal re-walks a predecessor resolved with rejections.** It has no
+  `Done` marker, so its rebuilt entry is an import in progress and its items are
+  offered again, which can bring back keys deleted since.
+* **A re-asked predecessor cannot undo what ran in the meantime.** Under a
+  snapshot policy, a predecessor first answering empty lets the same run import
+  an older generation; when the newer one is later re-asked (it held data after
+  all), a never-clobber writer keeps the older values. That is the first-attempt
+  residual (freenet/freenet-core#5857): only an attempt that has already seen
+  data is protected.
 
 ## freenet-migrate 0.6.0
 
