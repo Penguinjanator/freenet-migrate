@@ -2867,7 +2867,8 @@ pub(crate) trait WalkObserver<W> {
     fn items_seen(&self, predecessor: &DelegateKey) -> u32;
 
     /// Called before anything is written from a predecessor known to hold data:
-    /// before probing one whose earlier import started (`items` unknown), and
+    /// before probing one known to hold data from an earlier import (its
+    /// import started, or a count was kept; `items` unknown), and
     /// before the in-progress marker and first item of every data-bearing import
     /// (`items`: how many this export holds). `Err` vetoes it.
     fn before_import(
@@ -3044,8 +3045,11 @@ where
             // marker says so. Then a `Done { had_data: false }` seal contradicts it
             // and is not believed: the predecessor is asked again.
             let journal_started = observer.import_started(&key);
+            // So is a count the journal kept from an import that saw items (a
+            // rejection a higher revision reopened, whose marker may be gone).
+            let known_data = journal_started || observer.items_seen(&key) > 0;
             match marker {
-                Some(MigrationMarker::Done { had_data }) if had_data || !journal_started => {
+                Some(MigrationMarker::Done { had_data }) if had_data || !known_data => {
                     if had_data {
                         if observer.journaled()
                             && seal_is_bridged(successor, &key, generation, policy).await
@@ -3070,11 +3074,9 @@ where
             // NoData and fall through to older generations (resurrection). A
             // journal's started import is the same evidence.
             let (retry, prior_saw_data) = match marker {
-                Some(MigrationMarker::InProgress { saw_data }) => {
-                    (true, saw_data || journal_started)
-                }
+                Some(MigrationMarker::InProgress { saw_data }) => (true, saw_data || known_data),
                 Some(MigrationMarker::Done { .. }) => (true, true),
-                None => (journal_started, journal_started),
+                None => (known_data, known_data),
             };
 
             // A predecessor known to hold data may be partially written to the
@@ -15511,6 +15513,253 @@ mod tests {
                     JournalResolution::ImportedWithRejections { items_seen: 3, .. }
                 ))
             ));
+        }
+    }
+
+    /// #48: a rejection reopened by a higher import revision whose in-progress
+    /// marker was lost still holds data by the count its import kept, so an empty
+    /// retry is not believed and the rejected item is recovered later.
+    #[test]
+    fn a_reopened_rejection_without_its_marker_does_not_believe_an_empty_retry() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:x", b"X")];
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let _ = w.run(&mut MockIo::default().executable_with(&k, full), union());
+        assert!(matches!(
+            state_of(&w.store, &g1),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
+        ));
+        w.store.data.remove(&pred_wip_marker(&k));
+        w.permanent_fail.clear();
+        w.revision = 1;
+        let run = w.run(&mut MockIo::default().executable_with(&k, &[]), union());
+        assert!(
+            run.report.predecessors[0].exported_nothing_after_data(),
+            "{run:?}"
+        );
+        assert!(!run.status.expect("stored").is_complete());
+        let status = w
+            .run(&mut MockIo::default().executable_with(&k, full), union())
+            .status
+            .expect("stored");
+        assert!(status.is_complete(), "{status:?}");
+        assert_eq!(w.store.get_secret(b"room:x").as_deref(), Some(&b"X"[..]));
+    }
+
+    /// #48: an empty seal beside a counted, reopened rejection is not believed:
+    /// the predecessor is asked again.
+    #[test]
+    fn an_empty_seal_beside_a_counted_reopened_rejection_is_asked_again() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:x", b"X")];
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let _ = w.run(&mut MockIo::default().executable_with(&k, full), union());
+        w.store.data.remove(&pred_wip_marker(&k));
+        w.store
+            .set_secret(&pred_done_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+        w.permanent_fail.clear();
+        w.revision = 1;
+        let status = w
+            .run(&mut MockIo::default().executable_with(&k, full), union())
+            .status
+            .expect("stored");
+        assert!(status.is_complete(), "{status:?}");
+        assert_eq!(w.store.get_secret(b"room:x").as_deref(), Some(&b"X"[..]));
+    }
+
+    /// #48: an empty in-progress marker beside a counted, reopened rejection does
+    /// not make an empty retry believable.
+    #[test]
+    fn an_empty_in_progress_marker_beside_a_counted_rejection_is_not_believed() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let _ = w.run(
+            &mut MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:x", b"X")]),
+            union(),
+        );
+        w.store
+            .set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+        w.permanent_fail.clear();
+        w.revision = 1;
+        let run = w.run(&mut MockIo::default().executable_with(&k, &[]), union());
+        assert!(
+            run.report.predecessors[0].exported_nothing_after_data(),
+            "{run:?}"
+        );
+    }
+
+    fn pol(i: usize) -> SecretSelectionPolicy {
+        match i {
+            0 => union(),
+            1 => newest(),
+            _ => cont(),
+        }
+    }
+
+    fn cont() -> SecretSelectionPolicy {
+        SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+            RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+        )
+    }
+
+    /// PROBE (#48 gap A): a single-item predecessor whose only item was rejected
+    /// has items_seen == 1. `> 0` vs `> 1` boundary.
+    #[test]
+    fn probe_single_item_rejection_without_marker_is_known_data() {
+        for pi in 0..3usize {
+            let g1 = entry(1, 1);
+            let lineage = [g1];
+            let k = key_of(&g1);
+            let one: &[(&[u8], &[u8])] = &[(b"room:x", b"X")];
+            let mut w = InspectingWriter::new(&lineage);
+            w.permanent_fail.insert(b"room:x".to_vec());
+            let _ = w.run(&mut MockIo::default().executable_with(&k, one), pol(pi));
+            w.store.data.remove(&pred_wip_marker(&k));
+            w.permanent_fail.clear();
+            w.revision = 1;
+            let run = w.run(&mut MockIo::default().executable_with(&k, &[]), pol(pi));
+            assert!(
+                run.report.predecessors[0].exported_nothing_after_data(),
+                "{run:?}"
+            );
+            let status = w
+                .run(&mut MockIo::default().executable_with(&k, one), pol(pi))
+                .status
+                .expect("stored");
+            assert!(status.is_complete(), "{status:?}");
+        }
+    }
+
+    /// PROBE (gap B): the writer is told retry == true on the re-offer after a
+    /// reopened rejection whose marker was lost (no marker, journal import flag None).
+    #[test]
+    fn probe_reopened_rejection_without_marker_tells_writer_it_is_a_retry() {
+        for pi in 0..3usize {
+            let g1 = entry(1, 1);
+            let lineage = [g1];
+            let k = key_of(&g1);
+            let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:x", b"X")];
+            let mut w = InspectingWriter::new(&lineage);
+            w.permanent_fail.insert(b"room:x".to_vec());
+            let _ = w.run(&mut MockIo::default().executable_with(&k, full), pol(pi));
+            w.store.data.remove(&pred_wip_marker(&k));
+            w.permanent_fail.clear();
+            w.revision = 1;
+            w.retries.clear();
+            let _ = w.run(&mut MockIo::default().executable_with(&k, full), pol(pi));
+            assert!(!w.retries.is_empty());
+            assert!(w.retries.iter().all(|r| *r), "{:?}", w.retries);
+        }
+    }
+
+    /// PROBE (gap C): two generations, newest is a reopened rejection with lost
+    /// marker and now answers empty / silent. The older generation (data) must NOT
+    /// be imported/shadow under the NSW policies.
+    #[test]
+    fn probe_reopened_newest_rejection_empty_or_silent_does_not_fall_through() {
+        for pi in 1..3usize {
+            let name = pi;
+            for silent in [false, true] {
+                let (old, new) = (entry(1, 1), entry(2, 2));
+                let lineage = [old, new];
+                let (ko, kn) = (key_of(&old), key_of(&new));
+                let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:x", b"X")];
+                let mut w = InspectingWriter::new(&lineage);
+                w.permanent_fail.insert(b"room:x".to_vec());
+                let mk = |silent_new: bool| {
+                    let io = MockIo::default().executable_with(&ko, &[(b"old", b"O")]);
+                    if silent_new {
+                        io.silent_export(&kn)
+                    } else {
+                        io.executable_with(&kn, &[])
+                    }
+                };
+                let _ = w.run(
+                    &mut MockIo::default()
+                        .executable_with(&ko, &[(b"old", b"O")])
+                        .executable_with(&kn, full),
+                    pol(pi),
+                );
+                w.store.data.remove(&pred_wip_marker(&kn));
+                w.permanent_fail.clear();
+                w.revision = 1;
+                w.offered.clear();
+                let _ = w.run(&mut mk(silent), pol(pi));
+                assert!(
+                    !w.offered.contains(&b"old".to_vec()),
+                    "{name} silent={silent}: older generation was offered {:?}",
+                    w.offered
+                );
+            }
+        }
+    }
+
+    /// PROBE (gap D): the empty-seal case under every policy.
+    #[test]
+    fn probe_empty_seal_beside_counted_rejection_all_policies() {
+        for pi in 0..3usize {
+            let g1 = entry(1, 1);
+            let lineage = [g1];
+            let k = key_of(&g1);
+            let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:x", b"X")];
+            let mut w = InspectingWriter::new(&lineage);
+            w.permanent_fail.insert(b"room:x".to_vec());
+            let _ = w.run(&mut MockIo::default().executable_with(&k, full), pol(pi));
+            w.store.data.remove(&pred_wip_marker(&k));
+            w.store
+                .set_secret(&pred_done_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+            w.permanent_fail.clear();
+            w.revision = 1;
+            let status = w
+                .run(&mut MockIo::default().executable_with(&k, full), pol(pi))
+                .status
+                .expect("stored");
+            assert!(status.is_complete(), "{pi} {status:?}");
+            assert_eq!(
+                w.store.get_secret(b"room:x").as_deref(),
+                Some(&b"X"[..]),
+                "{pi}"
+            );
+        }
+    }
+
+    /// #48 under a snapshot policy: the newest generation is a reopened rejection
+    /// whose marker was lost and now answers empty. Its kept count says it holds
+    /// data, so the walk stops there, and the older generation it superseded is
+    /// not imported over it (a rollback).
+    #[test]
+    fn a_counted_newest_generation_answering_empty_does_not_let_an_older_one_roll_back() {
+        for make in [newest as fn() -> SecretSelectionPolicy, r10_cpu] {
+            let (g1, g2) = (entry(1, 1), entry(2, 2));
+            let lineage = [g1, g2];
+            let (k1, k2) = (key_of(&g1), key_of(&g2));
+            let mut w = InspectingWriter::new(&lineage);
+            w.permanent_fail.insert(b"room:x".to_vec());
+            let _ = w.run(
+                &mut MockIo::default()
+                    .executable_with(&k2, &[(b"room:a", b"A"), (b"room:x", b"X")])
+                    .executable_with(&k1, &[(b"room:old", b"O")]),
+                make(),
+            );
+            w.store.data.remove(&pred_wip_marker(&k2));
+            w.permanent_fail.clear();
+            w.revision = 1;
+            let _ = w.run(
+                &mut MockIo::default()
+                    .executable_with(&k2, &[])
+                    .executable_with(&k1, &[(b"room:old", b"O")]),
+                make(),
+            );
+            assert!(w.store.get_secret(b"room:old").is_none());
         }
     }
 }
