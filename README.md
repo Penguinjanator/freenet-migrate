@@ -22,7 +22,7 @@ Horizon-A step A3 of the graceful-upgrades design,
 **Design & rationale: [docs/design.md](./docs/design.md)** — why the crate is
 shaped this way (backward-probe over signed-pointer, preconditions as
 compile-time bounds, the `SecretTransport` seam) and the field-validated River
-0.6 → 0.8 re-key outcome.
+stdlib 0.6 → 0.8 re-key outcome.
 
 ## The problem
 
@@ -671,7 +671,9 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
 > **The transport is an internal, redesigned seam, not part of the app-facing
 > API.** Apps call `migrate_delegate_secrets`; today it drives the interim
 > app-side `DelegateRequest::ApplicationMessages` round-trips (as River/Delta do).
-> When the node-side copy-forward lands (freenet-core#2776), it slots under the
+> No node-side copy-forward exists today (the one wire for it was disabled in
+> freenet-core#5199 and removed in stdlib 0.9.0); the seam is kept so that, if
+> one is added (freenet-core#2776), it slots under the
 > *unchanged* entry point — it copies secrets between namespaces internally
 > without executing old code, killing the `ReRunOldWasm` / #204 landmine, and
 > needs no app re-adoption. This is the plan-v2 correction over v1's
@@ -825,7 +827,9 @@ the status those calls return reports it.
   `Unresponsive`, which the app must show rather than silently fresh-installing.
   A `probe_verdict` answering "not installed" (0.7.0) is reported the same way;
   it only feeds the journal's absent streak.
-  The node-side copy-forward removes the dependency by reading storage directly.
+  A node-side copy-forward would remove the dependency by reading storage
+  directly; none exists today (see "The transport is an internal, redesigned
+  seam" below).
 
 ## Building & testing
 
@@ -863,9 +867,12 @@ common case, not the rare one — which disabled migration in practice for any
 lineage longer than one generation ([#14]), and a durable completeness
 journal so an app knows when every predecessor has been dealt with ([#37]).
 
-**Published:** `freenet-migrate` **0.6.0**, `freenet-migrate-build` **0.2.0**.
+**Published:** `freenet-migrate` **0.7.0**, `freenet-migrate-build` **0.2.0**;
+**0.8.0** (unreleased) is the stdlib 0.12 line.
 The two halves version independently, so an app can take one without the other.
-Targets current stdlib **0.8.x**.
+0.8.x targets stdlib **0.12.x**; 0.7.x targets stdlib **0.8.x**. Pick the line
+matching your app's stdlib (an app cannot link two stdlib versions), and treat
+moving between them as a re-key of your contracts and delegates.
 
 **0.6.0** (published 2026-08-13) is breaking on the **contract** half — silence
 is no longer absence ([#19]). See [Upgrading to 0.6.0](#upgrading-to-060) and the
@@ -882,6 +889,11 @@ needs a code change to compile: every known adopter constructs
 `WriterStage::JournalFlag` and `JournalUnavailable` variants join a
 `#[non_exhaustive]` enum, and the journal and `probe_verdict` are new API with
 defaults.
+
+**0.8.0** (unreleased) has no code change of its own: it moves the stdlib
+requirement from 0.8 to 0.12, which changes the stdlib types in its signatures. See the CHANGELOG for why that is a minor
+bump, why there is no range spanning both, and what stdlib 0.12 changes for an
+app, and [Upgrading to 0.8.0](#upgrading-to-080) for the procedure.
 
 ### Adopters
 
@@ -909,12 +921,61 @@ and still hand-rolls its build-time registry codegen.
 
 freenet-git takes the build half only, and the reason is a hard constraint
 rather than a scheduling one. The runtime half is built against
-freenet-stdlib 0.8.x while that workspace is on 0.6.0, and stdlib exports
-`__frnt_set_id` as an unconditional `#[no_mangle] extern "C"` symbol
-(`rust/src/global.rs:4-5`), so linking two stdlib versions into one binary is
-a hard duplicate-symbol error under rust-lld. Adopting the runtime driver
-there is blocked on that workspace moving to stdlib 0.8, which re-keys every
-repo and is its own migration event.
+freenet-stdlib 0.8.x (crate 0.7) or 0.12.x (crate 0.8) while that workspace is
+on stdlib 0.6.0, and stdlib exports `__frnt_set_id` as an unconditional
+`#[no_mangle] extern "C"` symbol (`rust/src/global.rs:4-5`), so a binary that
+uses two stdlib versions fails to link with a duplicate-symbol error under
+rust-lld. (One that merely has a second, unused copy in its graph links
+cleanly, so the conflict can surface later than the dependency change that
+caused it.) Adopting
+the runtime driver there is blocked on that workspace moving to a stdlib line
+this crate targets, which re-keys every repo and is its own migration event.
+
+## Upgrading to 0.8.0
+
+0.8.0 has no code change; it moves the app to stdlib 0.12 (the stdlib types in
+this crate's signatures change with it), which re-keys every contract and
+delegate the app builds. (`freenet-migrate-build` has no stdlib dependency and
+stays at 0.2.) So the upgrade is the app's ordinary re-key procedure, done once
+for the stdlib and freenet-migrate together:
+
+1. **Before anything rebuilds**, record the outgoing generation of every
+   contract and delegate in its legacy registry: the code hash (and, for a
+   delegate, the delegate key and any params) of what is published now, which
+   should equal the committed WASM. Check each predecessor still instantiates
+   on current nodes (its WASM imports only host functions current nodes
+   provide); one that does not cannot export its secrets.
+2. Identify every artifact whose key must NOT move: a web container whose
+   contract id is the app's URL, a frozen pointer contract. Keep those on their
+   committed WASM and publish them from the committed bytes, never a rebuild,
+   or move them out of the workspace pinned to their old stdlib (which also
+   keeps their build reproducible).
+3. Move `freenet-stdlib` to 0.12 and `freenet-migrate` to 0.8 together, then
+   check that every non-dev crate under this lockfile is on one stdlib. This
+   must print exactly one line (two lines at one version means two sources,
+   e.g. crates.io and a path copy, which conflict just the same):
+
+   ```sh
+   cargo tree --workspace --all-features -e normal,build --target all \
+       --prefix none --format '{p}' \
+       | awk '$1=="freenet-stdlib"{sub(/ \(\*\)$/,""); print}' | sort -u
+   ```
+
+   `-e normal,build` leaves out dev-dependencies, which may legitimately pin an
+   older stdlib for native tests (plain `cargo tree -i freenet-stdlib` fails
+   with "specification `freenet-stdlib` is ambiguous" on those too), and
+   `--all-features` matters because contract and delegate builds use
+   non-default features. Run it once per lockfile: a crate excluded from the
+   workspace has its own.
+4. Rebuild the WASM of every artifact that re-keys (not the fixed-key ones from
+   step 2), sign a new pointer record at a higher version for each pointed-at
+   artifact, then rehearse the migration on an isolated network-mode node.
+5. Publish in order: the new artifacts and the UI first, then the pointer
+   records once the new UI is live. In an app whose open tabs reload on a
+   newer pointer (River does), a pointer published first reloads them into the
+   old UI.
+
+An app that is not ready to re-key stays on 0.7.
 
 ## Upgrading to 0.6.0
 
